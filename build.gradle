@@ -14,5 +14,7 @@ tasks.named('buildExtension') {
     exclude '.github/**'
     exclude '.agents/**'
     exclude '.codex/**'
+    exclude '.venv/**'
+    exclude '__pycache__/**'
     exclude 'target/**'
 }

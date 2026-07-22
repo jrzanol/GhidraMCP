@@ -42,13 +42,16 @@ def safe_get(endpoint: str, params: dict = None) -> list:
     except Exception as e:
         return [f"Request failed: {str(e)}"]
 
-def safe_post(endpoint: str, data: dict | str) -> str:
+def safe_post(endpoint: str, data: dict | str, timeout: float = 5) -> str:
     try:
         url = urljoin(ghidra_server_url, endpoint)
+        headers = {"X-GhidraMCP-Request": "bridge"}
         if isinstance(data, dict):
-            response = requests.post(url, data=data, timeout=5)
+            response = requests.post(url, data=data, headers=headers, timeout=timeout)
         else:
-            response = requests.post(url, data=data.encode("utf-8"), timeout=5)
+            response = requests.post(
+                url, data=data.encode("utf-8"), headers=headers, timeout=timeout
+            )
         response.encoding = 'utf-8'
         if response.ok:
             return response.text.strip()
@@ -286,6 +289,44 @@ def list_strings(offset: int = 0, limit: int = 2000, filter: str = None) -> list
     if filter:
         params["filter"] = filter
     return safe_get("strings", params)
+
+@mcp.tool()
+def execute_ghidra_script(
+    script_name: str,
+    arguments: list[str] | None = None,
+    timeout_seconds: int = 120,
+) -> str:
+    """
+    Execute a trusted script found in an enabled Ghidra ``ghidra_scripts`` directory.
+
+    Only a file name is accepted; paths and directory traversal are rejected. Script
+    output written with ``print``/``println`` is returned to the MCP client. Scripts
+    that display interactive dialogs may block until the user answers them in Ghidra.
+
+    Args:
+        script_name: Script file name including its extension, such as ``MyScript.java``.
+        arguments: Optional values exposed to the script through ``getScriptArgs()``.
+        timeout_seconds: How long to wait for completion, from 1 to 600 seconds.
+    """
+    if not script_name or any(char in script_name for char in ("/", "\\", ":", "\0")):
+        return "Error: script_name must be a file name, not a path"
+    if script_name in (".", ".."):
+        return "Error: script_name must be a file name, not a path"
+
+    script_arguments = arguments or []
+    if len(script_arguments) > 64:
+        return "Error: at most 64 script arguments are allowed"
+    if not 1 <= timeout_seconds <= 600:
+        return "Error: timeout_seconds must be between 1 and 600"
+
+    data = {
+        "script_name": script_name,
+        "argument_count": str(len(script_arguments)),
+    }
+    for index, argument in enumerate(script_arguments):
+        data[f"argument_{index}"] = argument
+
+    return safe_post("execute_script", data, timeout=timeout_seconds)
 
 def main():
     parser = argparse.ArgumentParser(description="MCP server for Ghidra")

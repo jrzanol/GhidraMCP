@@ -75,6 +75,19 @@ Alternatively, edit this file directly:
 
 The server IP and port are configurable and should be set to point to the target Ghidra instance. If not set, both will default to localhost:8080.
 
+### Running Ghidra scripts
+
+The `execute_ghidra_script` MCP tool runs a trusted script from an enabled
+`ghidra_scripts` directory. Pass only the file name (for example,
+`MyScript.java`), optional script arguments, and an optional timeout. Paths and
+directory traversal are rejected. Output produced by the script is returned to
+the MCP client. The execution endpoint accepts only local requests issued by the
+Python bridge.
+
+Only run scripts you trust: a Ghidra script executes with the same access to the
+current program and local machine as scripts launched from Ghidra's Script
+Manager.
+
 ## Example 2: Cline
 To use GhidraMCP with [Cline](https://cline.bot), this requires manually running the MCP server as well. First run the following command:
 

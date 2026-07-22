@@ -43,7 +43,13 @@ import ghidra.program.model.data.Undefined1DataType;
 import ghidra.program.model.listing.Variable;
 import ghidra.app.decompiler.component.DecompilerUtils;
 import ghidra.app.decompiler.ClangToken;
+import ghidra.app.script.GhidraScript;
+import ghidra.app.script.GhidraScriptProvider;
+import ghidra.app.script.GhidraScriptUtil;
+import ghidra.app.script.GhidraState;
+import ghidra.app.script.ScriptControls;
 import ghidra.framework.options.Options;
+import generic.jar.ResourceFile;
 
 import com.sun.net.httpserver.HttpExchange;
 import com.sun.net.httpserver.HttpServer;
@@ -51,6 +57,8 @@ import com.sun.net.httpserver.HttpServer;
 import javax.swing.SwingUtilities;
 import java.io.IOException;
 import java.io.OutputStream;
+import java.io.PrintWriter;
+import java.io.StringWriter;
 import java.lang.reflect.InvocationTargetException;
 import java.net.InetSocketAddress;
 import java.net.URLDecoder;
@@ -339,6 +347,38 @@ public class GhidraMCPPlugin extends Plugin {
             int limit = parseIntOrDefault(qparams.get("limit"), 100);
             String filter = qparams.get("filter");
             sendResponse(exchange, listDefinedStrings(offset, limit, filter));
+        });
+
+        server.createContext("/execute_script", exchange -> {
+            if (!"POST".equalsIgnoreCase(exchange.getRequestMethod())) {
+                sendResponse(exchange, 405, "Error: POST is required");
+                return;
+            }
+            if (!exchange.getRemoteAddress().getAddress().isLoopbackAddress()) {
+                sendResponse(exchange, 403,
+                    "Error: script execution is restricted to loopback clients");
+                return;
+            }
+            if (!"bridge".equals(exchange.getRequestHeaders()
+                    .getFirst("X-GhidraMCP-Request"))) {
+                sendResponse(exchange, 403,
+                    "Error: request must come through the GhidraMCP bridge");
+                return;
+            }
+
+            Map<String, String> params = parsePostParams(exchange);
+            String scriptName = params.get("script_name");
+            int argumentCount = parseIntOrDefault(params.get("argument_count"), 0);
+            if (argumentCount < 0 || argumentCount > 64) {
+                sendResponse(exchange, "Error: argument_count must be between 0 and 64");
+                return;
+            }
+
+            String[] scriptArguments = new String[argumentCount];
+            for (int i = 0; i < argumentCount; i++) {
+                scriptArguments[i] = params.getOrDefault("argument_" + i, "");
+            }
+            sendResponse(exchange, executeGhidraScript(scriptName, scriptArguments));
         });
 
         server.setExecutor(null);
@@ -777,6 +817,90 @@ public class GhidraMCPPlugin extends Plugin {
         }
 
         return result.toString();
+    }
+
+    /**
+     * Execute a trusted script from an enabled ghidra_scripts source directory.
+     */
+    private String executeGhidraScript(String scriptName, String[] scriptArguments) {
+        if (scriptName == null || scriptName.isBlank()) {
+            return "Error: script_name is required";
+        }
+        if (scriptName.contains("/") || scriptName.contains("\\") ||
+            scriptName.contains(":") || scriptName.contains("\0") ||
+            scriptName.equals(".") || scriptName.equals("..")) {
+            return "Error: script_name must be a file name, not a path";
+        }
+
+        Program program = getCurrentProgram();
+        if (program == null) {
+            return "Error: no program loaded";
+        }
+
+        try {
+            ResourceFile scriptFile = GhidraScriptUtil.findScriptByName(scriptName);
+            if (scriptFile == null || !scriptFile.isFile() ||
+                !scriptName.equals(scriptFile.getName())) {
+                return "Error: script not found in the enabled Ghidra script directories: " +
+                    scriptName;
+            }
+
+            ResourceFile sourceDirectory =
+                GhidraScriptUtil.findSourceDirectoryContaining(scriptFile);
+            if (sourceDirectory == null ||
+                !"ghidra_scripts".equalsIgnoreCase(sourceDirectory.getName())) {
+                return "Error: script is not inside a ghidra_scripts directory";
+            }
+
+            boolean sourceDirectoryEnabled = false;
+            String sourceCanonicalPath = sourceDirectory.getCanonicalPath();
+            for (ResourceFile enabledDirectory :
+                    GhidraScriptUtil.getEnabledScriptSourceDirectories()) {
+                if (sourceCanonicalPath.equals(enabledDirectory.getCanonicalPath())) {
+                    sourceDirectoryEnabled = true;
+                    break;
+                }
+            }
+            if (!sourceDirectoryEnabled) {
+                return "Error: the script directory is not enabled in Ghidra";
+            }
+
+            GhidraScriptProvider provider = GhidraScriptUtil.getProvider(scriptFile);
+            if (provider == null) {
+                return "Error: no Ghidra script provider supports " + scriptName;
+            }
+
+            StringWriter outputBuffer = new StringWriter();
+            try (PrintWriter writer = new PrintWriter(outputBuffer, true)) {
+                GhidraScript script = provider.getScriptInstance(scriptFile, writer);
+                script.setScriptArgs(scriptArguments != null ? scriptArguments : new String[0]);
+
+                CodeViewerService codeViewer = tool.getService(CodeViewerService.class);
+                ProgramLocation location =
+                    codeViewer != null ? codeViewer.getCurrentLocation() : null;
+                ghidra.program.util.ProgramSelection selection =
+                    codeViewer != null ? codeViewer.getCurrentSelection() : null;
+                GhidraState state = new GhidraState(
+                    tool, tool.getProject(), program, location, selection, null);
+
+                ScriptControls controls =
+                    new ScriptControls(writer, writer, new ConsoleTaskMonitor());
+                script.execute(state, controls);
+                writer.flush();
+            }
+
+            String output = outputBuffer.toString().stripTrailing();
+            String response = "Script executed successfully: " + scriptName;
+            return output.isEmpty() ? response : response + "\n\n" + output;
+        }
+        catch (Exception e) {
+            Msg.error(this, "Error executing Ghidra script " + scriptName, e);
+            String message = e.getMessage();
+            if (message == null || message.isBlank()) {
+                message = e.getClass().getSimpleName();
+            }
+            return "Error executing script " + scriptName + ": " + message;
+        }
     }
 
     /**
@@ -1631,9 +1755,14 @@ public class GhidraMCPPlugin extends Plugin {
     }
 
     private void sendResponse(HttpExchange exchange, String response) throws IOException {
+        sendResponse(exchange, 200, response);
+    }
+
+    private void sendResponse(HttpExchange exchange, int statusCode, String response)
+            throws IOException {
         byte[] bytes = response.getBytes(StandardCharsets.UTF_8);
         exchange.getResponseHeaders().set("Content-Type", "text/plain; charset=utf-8");
-        exchange.sendResponseHeaders(200, bytes.length);
+        exchange.sendResponseHeaders(statusCode, bytes.length);
         try (OutputStream os = exchange.getResponseBody()) {
             os.write(bytes);
         }

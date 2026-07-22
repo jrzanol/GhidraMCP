@@ -8,6 +8,7 @@
 
 # Compiled class files
 *.class
+__pycache__/
 
 # Logs
 *.log
