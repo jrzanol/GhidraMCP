@@ -242,6 +242,65 @@ created; the description is used only during this initial creation.
 - Example:
   `{"function_address": "00523000", "tag_name": "TMNativeAPI::Network", "tag_description": "Network functions"}`
 
+## Bookmarks and Global Data
+
+### `register_global_data`
+
+Registers typed global data at an address and creates or promotes its label as the
+primary symbol. Before changing the program, the tool checks whether the same
+address already has an equivalent data type, total size, and primary label. If it
+does, the tool reports that the global is already registered and makes no changes.
+The same protection applies when the requested address falls anywhere inside an
+existing defined data item. For example, an address at byte offset `8` inside an
+array of 100 integers is reported as already covered; no overlapping global or
+label is created.
+
+- Parameters: `location`, `label`, `data_type`, `size`, and optional
+  `replace_existing` (default `false`).
+- Example:
+  `{"location": "00BC1EF8", "label": "g_pCollectionData", "data_type": "DWORD", "size": 4}`
+- Array example:
+  `{"location": "00BC2000", "label": "g_itemIds", "data_type": "DWORD", "size": 64}`
+
+The data type must already exist in Ghidra, except for common built-in aliases and
+pointer types. When `size` is a compatible multiple of a fixed-size type, the tool
+creates an array. A new larger declaration automatically consumes fully contained
+smaller data declarations and removes their labels. For example, creating ten
+integers may absorb a previously defined integer in the middle of that range. A
+data item that crosses the requested end remains protected, and the error reports
+the exact conflict address and both ranges. Instructions are also protected unless
+`replace_existing` is `true`.
+
+### `delete_global_data`
+
+Deletes the top-level defined global data that contains an address, including its
+non-dynamic labels. The supplied address may be the global's start or any location
+inside an array or structure. Bookmarks are preserved because they are separate
+Ghidra objects.
+
+- Parameter: `location`.
+- Example: `{"location": "00BC1EF8"}`
+
+The result reports the requested location, complete deleted range, data type,
+size, and deleted labels. If no defined data contains the address, no changes are
+made.
+
+### `add_bookmark`
+
+Creates or updates a categorized bookmark at a program address. Ghidra stores the
+bookmark's Category, Location, Type, and comment. The Bookmark table's Label and
+Code Unit columns are derived automatically from the primary symbol and code/data
+already present at the address.
+
+- Parameters: `category`, `location`, optional `comment`, and optional
+  `bookmark_type` (default `Info`).
+- Example:
+  `{"category": "ExportGlobals", "location": "00BC1EF8", "comment": "Export this global"}`
+
+To register an exportable global with a specific label, type, and size, call
+`register_global_data` first and then call `add_bookmark` at the same address with
+the desired category. Repeating an identical bookmark request makes no changes.
+
 ## Script Execution
 
 ### `execute_ghidra_script`

@@ -38,6 +38,8 @@ import ghidra.program.model.pcode.HighVariable;
 import ghidra.program.model.pcode.Varnode;
 import ghidra.program.model.data.DataType;
 import ghidra.program.model.data.DataTypeManager;
+import ghidra.program.model.data.ArrayDataType;
+import ghidra.program.model.data.DataUtilities;
 import ghidra.program.model.data.PointerDataType;
 import ghidra.program.model.data.Undefined1DataType;
 import ghidra.program.model.listing.Variable;
@@ -352,6 +354,81 @@ public class GhidraMCPPlugin extends Plugin {
                 params.get("function_address"),
                 params.get("tag_name"),
                 params.get("tag_description")));
+        });
+
+        server.createContext("/add_bookmark", exchange -> {
+            if (!"POST".equalsIgnoreCase(exchange.getRequestMethod())) {
+                sendResponse(exchange, 405, "Error: POST is required");
+                return;
+            }
+            if (!exchange.getRemoteAddress().getAddress().isLoopbackAddress()) {
+                sendResponse(exchange, 403,
+                    "Error: bookmark creation is restricted to loopback clients");
+                return;
+            }
+            if (!"bridge".equals(exchange.getRequestHeaders()
+                    .getFirst("X-GhidraMCP-Request"))) {
+                sendResponse(exchange, 403,
+                    "Error: request must come through the GhidraMCP bridge");
+                return;
+            }
+
+            Map<String, String> params = parsePostParams(exchange);
+            sendResponse(exchange, addBookmark(
+                params.get("category"),
+                params.get("location"),
+                params.get("comment"),
+                params.get("bookmark_type")));
+        });
+
+        server.createContext("/register_global_data", exchange -> {
+            if (!"POST".equalsIgnoreCase(exchange.getRequestMethod())) {
+                sendResponse(exchange, 405, "Error: POST is required");
+                return;
+            }
+            if (!exchange.getRemoteAddress().getAddress().isLoopbackAddress()) {
+                sendResponse(exchange, 403,
+                    "Error: global data registration is restricted to loopback clients");
+                return;
+            }
+            if (!"bridge".equals(exchange.getRequestHeaders()
+                    .getFirst("X-GhidraMCP-Request"))) {
+                sendResponse(exchange, 403,
+                    "Error: request must come through the GhidraMCP bridge");
+                return;
+            }
+
+            Map<String, String> params = parsePostParams(exchange);
+            int size = parseIntOrDefault(params.get("size"), -1);
+            boolean replaceExisting =
+                Boolean.parseBoolean(params.getOrDefault("replace_existing", "false"));
+            sendResponse(exchange, registerGlobalData(
+                params.get("location"),
+                params.get("label"),
+                params.get("data_type"),
+                size,
+                replaceExisting));
+        });
+
+        server.createContext("/delete_global_data", exchange -> {
+            if (!"POST".equalsIgnoreCase(exchange.getRequestMethod())) {
+                sendResponse(exchange, 405, "Error: POST is required");
+                return;
+            }
+            if (!exchange.getRemoteAddress().getAddress().isLoopbackAddress()) {
+                sendResponse(exchange, 403,
+                    "Error: global data deletion is restricted to loopback clients");
+                return;
+            }
+            if (!"bridge".equals(exchange.getRequestHeaders()
+                    .getFirst("X-GhidraMCP-Request"))) {
+                sendResponse(exchange, 403,
+                    "Error: request must come through the GhidraMCP bridge");
+                return;
+            }
+
+            Map<String, String> params = parsePostParams(exchange);
+            sendResponse(exchange, deleteGlobalData(params.get("location")));
         });
 
         server.createContext("/strings", exchange -> {
@@ -1066,6 +1143,416 @@ public class GhidraMCPPlugin extends Plugin {
 
     private String normalizeTagComment(String comment) {
         return comment == null ? "" : comment.replace('\r', ' ').replace('\n', ' ').trim();
+    }
+
+    private String addBookmark(
+            String category, String location, String comment, String bookmarkType) {
+        Program program = getCurrentProgram();
+        if (program == null) {
+            return "Error: no program loaded";
+        }
+        if (category == null || category.isBlank()) {
+            return "Error: category is required";
+        }
+        if (location == null || location.isBlank()) {
+            return "Error: location is required";
+        }
+        if (category.indexOf('\n') >= 0 || category.indexOf('\r') >= 0) {
+            return "Error: category must be a single-line value";
+        }
+
+        try {
+            Address address = program.getAddressFactory().getAddress(location);
+            if (address == null) {
+                return "Error: invalid location: " + location;
+            }
+
+            BookmarkManager bookmarkManager = program.getBookmarkManager();
+            String resolvedBookmarkType = resolveBookmarkType(bookmarkManager, bookmarkType);
+            if (resolvedBookmarkType == null) {
+                return "Error: unknown bookmark_type: " + bookmarkType;
+            }
+
+            String normalizedComment = comment == null ? "" : comment.trim();
+            Bookmark existing = bookmarkManager.getBookmark(
+                address, resolvedBookmarkType, category.trim());
+            if (existing != null && normalizedComment.equals(existing.getComment())) {
+                return formatBookmarkResult(
+                    "Bookmark already exists", program, existing);
+            }
+
+            int transaction = program.startTransaction("Add bookmark");
+            boolean commit = false;
+            try {
+                Bookmark bookmark = bookmarkManager.setBookmark(
+                    address, resolvedBookmarkType, category.trim(), normalizedComment);
+
+                commit = true;
+                return formatBookmarkResult("Bookmark created successfully", program, bookmark);
+            }
+            finally {
+                program.endTransaction(transaction, commit);
+            }
+        }
+        catch (Exception e) {
+            Msg.error(this, "Error creating bookmark", e);
+            String message = e.getMessage();
+            return "Error creating bookmark: " +
+                (message == null || message.isBlank() ? e.getClass().getSimpleName() : message);
+        }
+    }
+
+    private String formatBookmarkResult(String status, Program program, Bookmark bookmark) {
+        Address address = bookmark.getAddress();
+        Symbol primary = program.getSymbolTable().getPrimarySymbol(address);
+        CodeUnit codeUnit = program.getListing().getCodeUnitAt(address);
+        String label = primary == null ? "<none>" : primary.getName();
+        String codeUnitDescription = "<none>";
+        if (codeUnit instanceof Data data) {
+            codeUnitDescription = data.getDataType().getDisplayName() +
+                " (" + data.getLength() + " bytes)";
+        }
+        else if (codeUnit != null) {
+            codeUnitDescription = codeUnit.getMnemonicString() +
+                " (" + codeUnit.getLength() + " bytes)";
+        }
+        return status + "\n" +
+            "Category: " + bookmark.getCategory() + "\n" +
+            "Location: " + address + "\n" +
+            "Label: " + label + "\n" +
+            "Code Unit: " + codeUnitDescription + "\n" +
+            "Bookmark Type: " + bookmark.getTypeString();
+    }
+
+    private String registerGlobalData(
+            String location, String label, String dataTypeName, int size,
+            boolean replaceExisting) {
+        Program program = getCurrentProgram();
+        if (program == null) {
+            return "Error: no program loaded";
+        }
+        if (location == null || location.isBlank()) {
+            return "Error: location is required";
+        }
+        if (label == null || label.isBlank()) {
+            return "Error: label is required";
+        }
+        if (dataTypeName == null || dataTypeName.isBlank()) {
+            return "Error: data_type is required";
+        }
+        if (size <= 0 || size > 64 * 1024 * 1024) {
+            return "Error: size must be between 1 and 67108864 bytes";
+        }
+        if (label.indexOf('\n') >= 0 || label.indexOf('\r') >= 0) {
+            return "Error: label must be a single-line value";
+        }
+
+        try {
+            Address address = program.getAddressFactory().getAddress(location);
+            if (address == null) {
+                return "Error: invalid location: " + location;
+            }
+
+            Data containingData = program.getListing().getDefinedDataContaining(address);
+            if (containingData != null && !address.equals(containingData.getAddress())) {
+                Symbol containingLabel = program.getSymbolTable().getPrimarySymbol(
+                    containingData.getAddress());
+                long offset = address.subtract(containingData.getAddress());
+                return "Global data already registered: requested location is inside " +
+                    "existing data\n" +
+                    "Requested Location: " + address + "\n" +
+                    "Existing Location: " + containingData.getAddress() + "\n" +
+                    "Offset: 0x" + Long.toHexString(offset).toUpperCase() + "\n" +
+                    "Label: " + (containingLabel == null
+                        ? "<none>" : containingLabel.getName()) + "\n" +
+                    "Data Type: " + containingData.getDataType().getDisplayName() + "\n" +
+                    "Size: " + containingData.getLength() + " bytes";
+            }
+
+            DataTypeManager dataTypeManager = program.getDataTypeManager();
+            DataType baseType = resolveGlobalDataType(dataTypeManager, dataTypeName.trim());
+            if (baseType == null) {
+                return "Error: data type not found: " + dataTypeName;
+            }
+            DataType appliedType = createSizedDataType(baseType, size, dataTypeManager);
+            if (appliedType == null) {
+                return "Error: size " + size + " is incompatible with fixed-size type " +
+                    baseType.getDisplayName() + " (" + baseType.getLength() + " bytes)";
+            }
+
+            String normalizedLabel = label.trim();
+            Symbol matchingLabel = null;
+            for (Symbol symbol : program.getSymbolTable().getSymbols(address)) {
+                if (normalizedLabel.equals(symbol.getName())) {
+                    matchingLabel = symbol;
+                    break;
+                }
+            }
+            SymbolIterator namedSymbols = program.getSymbolTable().getSymbols(normalizedLabel);
+            while (namedSymbols.hasNext()) {
+                Symbol symbol = namedSymbols.next();
+                if (!address.equals(symbol.getAddress()) && !symbol.isExternal()) {
+                    return "Error: label already exists at another location: " +
+                        normalizedLabel + " at " + symbol.getAddress();
+                }
+            }
+
+            Data existingData = program.getListing().getDataAt(address);
+            boolean matchingData = existingData != null &&
+                existingData.getLength() == size &&
+                existingData.getDataType().isEquivalent(appliedType);
+            if (matchingData && matchingLabel != null && matchingLabel.isPrimary()) {
+                return formatGlobalDataResult(
+                    "Global data already registered", existingData, matchingLabel);
+            }
+
+            Address endAddress;
+            try {
+                endAddress = address.addNoWrap(size - 1L);
+            }
+            catch (Exception e) {
+                return "Error: requested global range overflows the address space at " +
+                    address;
+            }
+
+            Listing listing = program.getListing();
+            Instruction containingInstruction = listing.getInstructionContaining(address);
+            if (containingInstruction != null &&
+                    containingInstruction.getMinAddress().compareTo(address) < 0) {
+                return formatRangeConflict(
+                    address, endAddress, containingInstruction,
+                    "requested location falls inside an existing instruction");
+            }
+            InstructionIterator instructions = listing.getInstructions(address, true);
+            while (instructions.hasNext()) {
+                Instruction instruction = instructions.next();
+                if (instruction.getMinAddress().compareTo(endAddress) > 0) {
+                    break;
+                }
+                if (instruction.getMaxAddress().compareTo(endAddress) > 0) {
+                    return formatRangeConflict(
+                        address, endAddress, instruction, "instruction extends past the end");
+                }
+                if (!replaceExisting) {
+                    return formatRangeConflict(
+                        address, endAddress, instruction,
+                        "instruction is protected; set replace_existing=true to replace it");
+                }
+            }
+
+            List<Data> consumedData = new ArrayList<>();
+            DataIterator definedData = listing.getDefinedData(address, true);
+            while (definedData.hasNext()) {
+                Data data = definedData.next();
+                if (data.getMinAddress().compareTo(endAddress) > 0) {
+                    break;
+                }
+                if (data.getMaxAddress().compareTo(endAddress) > 0) {
+                    return formatRangeConflict(
+                        address, endAddress, data, "defined data extends past the end");
+                }
+                if (!(matchingData && address.equals(data.getAddress()))) {
+                    consumedData.add(data);
+                }
+            }
+            List<Address> consumedAddresses = consumedData.stream()
+                .map(Data::getAddress)
+                .distinct()
+                .toList();
+
+            int transaction = program.startTransaction("Register global data");
+            boolean commit = false;
+            try {
+                Data data = existingData;
+                if (!matchingData) {
+                    for (Data consumed : consumedData) {
+                        deleteDataLabels(
+                            program, consumed.getAddress(), address, normalizedLabel);
+                    }
+                    DataUtilities.ClearDataMode clearMode =
+                        replaceExisting || !consumedData.isEmpty()
+                        ? DataUtilities.ClearDataMode.CLEAR_ALL_CONFLICT_DATA
+                        : DataUtilities.ClearDataMode.CLEAR_ALL_DEFAULT_CONFLICT_DATA;
+                    data = DataUtilities.createData(
+                        program, address, appliedType, size, clearMode);
+                }
+                if (matchingLabel == null) {
+                    matchingLabel = program.getSymbolTable().createLabel(
+                        address, normalizedLabel, SourceType.USER_DEFINED);
+                }
+                matchingLabel.setPrimary();
+
+                commit = true;
+                String result = formatGlobalDataResult(
+                    "Global data registered successfully", data, matchingLabel);
+                if (!consumedAddresses.isEmpty()) {
+                    result += "\nConsumed Global Data: " + consumedAddresses.size() +
+                        "\nConsumed Locations: " + consumedAddresses.stream()
+                            .map(Address::toString)
+                            .collect(java.util.stream.Collectors.joining(", "));
+                }
+                return result;
+            }
+            finally {
+                program.endTransaction(transaction, commit);
+            }
+        }
+        catch (Exception e) {
+            Msg.error(this, "Error registering global data", e);
+            String message = e.getMessage();
+            return "Error registering global data: " +
+                (message == null || message.isBlank() ? e.getClass().getSimpleName() : message);
+        }
+    }
+
+    private String formatRangeConflict(
+            Address requestedStart, Address requestedEnd, CodeUnit conflict,
+            String reason) {
+        return "Error: global data range conflict\n" +
+            "Requested Range: " + requestedStart + " - " + requestedEnd + "\n" +
+            "Conflict Address: " + conflict.getMinAddress() + "\n" +
+            "Conflict Range: " + conflict.getMinAddress() + " - " +
+                conflict.getMaxAddress() + "\n" +
+            "Conflict Type: " + (conflict instanceof Data data
+                ? data.getDataType().getDisplayName() : conflict.getMnemonicString()) + "\n" +
+            "Reason: " + reason;
+    }
+
+    private void deleteDataLabels(
+            Program program, Address dataAddress, Address requestedAddress,
+            String requestedLabel) {
+        for (Symbol symbol : program.getSymbolTable().getSymbols(dataAddress)) {
+            boolean preserveRequestedLabel = dataAddress.equals(requestedAddress) &&
+                requestedLabel.equals(symbol.getName());
+            if (!preserveRequestedLabel && !symbol.isDynamic() &&
+                    symbol.getSymbolType() == SymbolType.LABEL) {
+                symbol.delete();
+            }
+        }
+    }
+
+    private String deleteGlobalData(String location) {
+        Program program = getCurrentProgram();
+        if (program == null) {
+            return "Error: no program loaded";
+        }
+        if (location == null || location.isBlank()) {
+            return "Error: location is required";
+        }
+
+        try {
+            Address requestedAddress = program.getAddressFactory().getAddress(location);
+            if (requestedAddress == null) {
+                return "Error: invalid location: " + location;
+            }
+            Data data = program.getListing().getDefinedDataContaining(requestedAddress);
+            if (data == null) {
+                return "Global data not found at or containing address: " + requestedAddress;
+            }
+            data = data.getRoot();
+            Address dataAddress = data.getAddress();
+            Address dataEnd = data.getMaxAddress();
+            String dataType = data.getDataType().getDisplayName();
+            int dataSize = data.getLength();
+            List<String> deletedLabels = new ArrayList<>();
+
+            int transaction = program.startTransaction("Delete global data");
+            boolean commit = false;
+            try {
+                for (Symbol symbol : program.getSymbolTable().getSymbols(dataAddress)) {
+                    if (!symbol.isDynamic() && symbol.getSymbolType() == SymbolType.LABEL) {
+                        deletedLabels.add(symbol.getName());
+                        symbol.delete();
+                    }
+                }
+                program.getListing().clearCodeUnits(dataAddress, dataEnd, false);
+                commit = true;
+            }
+            finally {
+                program.endTransaction(transaction, commit);
+            }
+
+            return "Global data deleted successfully\n" +
+                "Requested Location: " + requestedAddress + "\n" +
+                "Deleted Range: " + dataAddress + " - " + dataEnd + "\n" +
+                "Data Type: " + dataType + "\n" +
+                "Size: " + dataSize + " bytes\n" +
+                "Deleted Labels: " + (deletedLabels.isEmpty()
+                    ? "<none>" : String.join(", ", deletedLabels)) + "\n" +
+                "Bookmarks: preserved";
+        }
+        catch (Exception e) {
+            Msg.error(this, "Error deleting global data", e);
+            String message = e.getMessage();
+            return "Error deleting global data: " +
+                (message == null || message.isBlank() ? e.getClass().getSimpleName() : message);
+        }
+    }
+
+    private String formatGlobalDataResult(String status, Data data, Symbol labelSymbol) {
+        return status + "\n" +
+            "Location: " + data.getAddress() + "\n" +
+            "Label: " + labelSymbol.getName() + "\n" +
+            "Data Type: " + data.getDataType().getDisplayName() + "\n" +
+            "Size: " + data.getLength() + " bytes";
+    }
+
+    private String resolveBookmarkType(BookmarkManager bookmarkManager, String requestedType) {
+        String typeName = requestedType == null || requestedType.isBlank()
+            ? BookmarkType.INFO
+            : requestedType.trim();
+        for (BookmarkType type : bookmarkManager.getBookmarkTypes()) {
+            if (type.getTypeString().equalsIgnoreCase(typeName)) {
+                return type.getTypeString();
+            }
+        }
+        return null;
+    }
+
+    private DataType resolveGlobalDataType(DataTypeManager dataTypeManager, String typeName) {
+        DataType directType = findDataTypeByNameInAllCategories(dataTypeManager, typeName);
+        if (directType != null) {
+            return directType;
+        }
+
+        if (typeName.endsWith("*")) {
+            String baseTypeName = typeName.substring(0, typeName.length() - 1).trim();
+            DataType pointedTo = resolveGlobalDataType(dataTypeManager, baseTypeName);
+            return pointedTo == null ? null : new PointerDataType(pointedTo);
+        }
+
+        return switch (typeName.toLowerCase()) {
+            case "undefined", "undefined1" -> Undefined1DataType.dataType;
+            case "int", "long" -> dataTypeManager.getDataType("/int");
+            case "uint", "unsigned int", "unsigned long", "dword" ->
+                dataTypeManager.getDataType("/uint");
+            case "short" -> dataTypeManager.getDataType("/short");
+            case "ushort", "unsigned short", "word" ->
+                dataTypeManager.getDataType("/ushort");
+            case "char", "byte" -> dataTypeManager.getDataType("/char");
+            case "uchar", "unsigned char" -> dataTypeManager.getDataType("/uchar");
+            case "longlong", "__int64" -> dataTypeManager.getDataType("/longlong");
+            case "ulonglong", "unsigned __int64", "qword" ->
+                dataTypeManager.getDataType("/ulonglong");
+            case "bool", "boolean" -> dataTypeManager.getDataType("/bool");
+            default -> null;
+        };
+    }
+
+    private DataType createSizedDataType(
+            DataType baseType, int requestedSize, DataTypeManager dataTypeManager) {
+        int baseLength = baseType.getLength();
+        if (baseLength <= 0) {
+            return baseType;
+        }
+        if (baseLength == requestedSize) {
+            return baseType;
+        }
+        if (requestedSize > baseLength && requestedSize % baseLength == 0) {
+            return new ArrayDataType(
+                baseType, requestedSize / baseLength, baseLength, dataTypeManager);
+        }
+        return null;
     }
 
     /**

@@ -321,6 +321,105 @@ def add_function_tag(
     })
 
 @mcp.tool()
+def add_bookmark(
+    category: str,
+    location: str,
+    comment: str = "",
+    bookmark_type: str = "Info",
+) -> str:
+    """
+    Create or update a categorized Ghidra bookmark at an address.
+
+    Ghidra stores the Category, Location, bookmark type, and comment. The Bookmark
+    table's Label and Code Unit columns are derived from the program symbol and data
+    at ``location``. Use ``register_global_data`` first when those columns need a
+    specific global name, data type, and size.
+
+    Args:
+        category: Bookmark category, such as ``ExportGlobals``.
+        location: Program address, such as ``00BC1EF8``.
+        comment: Optional bookmark comment.
+        bookmark_type: Existing Ghidra bookmark type (default ``Info``).
+    """
+    if not category or not category.strip():
+        return "Error: category is required"
+    if not location:
+        return "Error: location is required"
+    if "\n" in category or "\r" in category:
+        return "Error: category must be a single line"
+
+    return safe_post("add_bookmark", {
+        "category": category.strip(),
+        "location": location,
+        "comment": comment,
+        "bookmark_type": bookmark_type,
+    })
+
+@mcp.tool()
+def register_global_data(
+    location: str,
+    label: str,
+    data_type: str,
+    size: int,
+    replace_existing: bool = False,
+) -> str:
+    """
+    Register typed global data and its primary symbol in the current program.
+
+    If the same address already has equivalent data, size, and primary label, the
+    tool reports that it is already registered and makes no changes. By default it
+    also reports "already registered" when the address falls inside an existing
+    defined data item, preventing overlapping globals. A larger declaration
+    automatically consumes fully contained smaller data declarations and their
+    labels. Instructions remain protected unless ``replace_existing`` is true, and
+    partially overlapping data remains protected. A larger compatible size creates
+    an array of the requested data type.
+
+    Args:
+        location: Address of the global data, such as ``00BC1EF8``.
+        label: Primary symbol name, such as ``g_pCollectionData``.
+        data_type: Existing Ghidra data type name, such as ``DWORD`` or
+            ``STRUCT_ITEM``.
+        size: Total data size in bytes.
+        replace_existing: Whether conflicting defined code/data may be cleared.
+    """
+    if not location:
+        return "Error: location is required"
+    if not label or not label.strip():
+        return "Error: label is required"
+    if "\n" in label or "\r" in label:
+        return "Error: label must be a single line"
+    if not data_type or not data_type.strip():
+        return "Error: data_type is required"
+    if not 1 <= size <= 64 * 1024 * 1024:
+        return "Error: size must be between 1 and 67108864 bytes"
+
+    return safe_post("register_global_data", {
+        "location": location,
+        "label": label.strip(),
+        "data_type": data_type.strip(),
+        "size": str(size),
+        "replace_existing": str(replace_existing).lower(),
+    })
+
+@mcp.tool()
+def delete_global_data(location: str) -> str:
+    """
+    Delete the defined global data containing an address and its labels.
+
+    The address may be the start of the global or any address inside it. The whole
+    top-level data item is cleared. Bookmarks are kept because they are managed
+    separately by Ghidra.
+
+    Args:
+        location: Start address or an address inside the global data item.
+    """
+    if not location:
+        return "Error: location is required"
+
+    return safe_post("delete_global_data", {"location": location})
+
+@mcp.tool()
 def list_strings(offset: int = 0, limit: int = 2000, filter: str = None) -> list:
     """
     List all defined strings in the program with their addresses.
