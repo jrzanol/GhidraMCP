@@ -42,6 +42,9 @@ import ghidra.program.model.data.ArrayDataType;
 import ghidra.program.model.data.DataUtilities;
 import ghidra.program.model.data.PointerDataType;
 import ghidra.program.model.data.Undefined1DataType;
+import ghidra.program.model.data.CategoryPath;
+import ghidra.program.model.data.DataTypeComponent;
+import ghidra.program.model.data.Structure;
 import ghidra.program.model.listing.Variable;
 import ghidra.app.decompiler.component.DecompilerUtils;
 import ghidra.app.decompiler.ClangToken;
@@ -429,6 +432,73 @@ public class GhidraMCPPlugin extends Plugin {
 
             Map<String, String> params = parsePostParams(exchange);
             sendResponse(exchange, deleteGlobalData(params.get("location")));
+        });
+
+        server.createContext("/struct_fields", exchange -> {
+            Map<String, String> params = parseQueryParams(exchange);
+            sendResponse(exchange, listStructFields(
+                params.get("category_path"), params.get("struct_name")));
+        });
+
+        server.createContext("/add_struct_field", exchange -> {
+            if (!validateBridgeMutationRequest(exchange, "struct field addition")) {
+                return;
+            }
+            Map<String, String> params = parsePostParams(exchange);
+            sendResponse(exchange, addStructField(
+                params.get("category_path"),
+                params.get("struct_name"),
+                parseIntOrDefault(params.get("offset"), -1),
+                params.get("field_name"),
+                params.get("data_type"),
+                parseIntOrDefault(params.get("length"), -1),
+                params.get("comment")));
+        });
+
+        server.createContext("/remove_struct_field", exchange -> {
+            if (!validateBridgeMutationRequest(exchange, "struct field removal")) {
+                return;
+            }
+            Map<String, String> params = parsePostParams(exchange);
+            sendResponse(exchange, removeStructField(
+                params.get("category_path"),
+                params.get("struct_name"),
+                parseIntOrDefault(params.get("offset"), -1)));
+        });
+
+        server.createContext("/modify_struct_field", exchange -> {
+            if (!validateBridgeMutationRequest(exchange, "struct field modification")) {
+                return;
+            }
+            Map<String, String> params = parsePostParams(exchange);
+            sendResponse(exchange, modifyStructField(
+                params.get("category_path"),
+                params.get("struct_name"),
+                parseIntOrDefault(params.get("offset"), -1),
+                Boolean.parseBoolean(params.getOrDefault("has_new_offset", "false")),
+                parseIntOrDefault(params.get("new_offset"), -1),
+                Boolean.parseBoolean(params.getOrDefault("has_new_name", "false")),
+                params.get("new_name"),
+                Boolean.parseBoolean(params.getOrDefault("has_new_data_type", "false")),
+                params.get("new_data_type"),
+                Boolean.parseBoolean(params.getOrDefault("has_new_length", "false")),
+                parseIntOrDefault(params.get("new_length"), -1),
+                Boolean.parseBoolean(params.getOrDefault("has_new_comment", "false")),
+                params.get("new_comment")));
+        });
+
+        server.createContext("/modify_struct", exchange -> {
+            if (!validateBridgeMutationRequest(exchange, "struct modification")) {
+                return;
+            }
+            Map<String, String> params = parsePostParams(exchange);
+            sendResponse(exchange, modifyStruct(
+                params.get("category_path"),
+                params.get("struct_name"),
+                Boolean.parseBoolean(params.getOrDefault("has_new_name", "false")),
+                params.get("new_name"),
+                Boolean.parseBoolean(params.getOrDefault("has_new_size", "false")),
+                parseIntOrDefault(params.get("new_size"), -1)));
         });
 
         server.createContext("/strings", exchange -> {
@@ -1487,6 +1557,580 @@ public class GhidraMCPPlugin extends Plugin {
             return "Error deleting global data: " +
                 (message == null || message.isBlank() ? e.getClass().getSimpleName() : message);
         }
+    }
+
+    private boolean validateBridgeMutationRequest(HttpExchange exchange, String operation)
+            throws IOException {
+        if (!"POST".equalsIgnoreCase(exchange.getRequestMethod())) {
+            sendResponse(exchange, 405, "Error: POST is required");
+            return false;
+        }
+        if (!exchange.getRemoteAddress().getAddress().isLoopbackAddress()) {
+            sendResponse(exchange, 403,
+                "Error: " + operation + " is restricted to loopback clients");
+            return false;
+        }
+        if (!"bridge".equals(exchange.getRequestHeaders()
+                .getFirst("X-GhidraMCP-Request"))) {
+            sendResponse(exchange, 403,
+                "Error: request must come through the GhidraMCP bridge");
+            return false;
+        }
+        return true;
+    }
+
+    private String listStructFields(String categoryPathText, String structName) {
+        Program program = getCurrentProgram();
+        if (program == null) {
+            return "Error: no program loaded";
+        }
+        String validationError = validateStructReference(categoryPathText, structName);
+        if (validationError != null) {
+            return validationError;
+        }
+
+        try {
+            Structure structure = findStructure(
+                program.getDataTypeManager(), categoryPathText, structName);
+            if (structure == null) {
+                return structNotFoundError(categoryPathText, structName);
+            }
+
+            StringBuilder result = new StringBuilder();
+            result.append("Structure: ").append(structure.getPathName()).append('\n');
+            result.append("Size: ").append(structure.getLength()).append(" bytes\n");
+            result.append("Packing: ")
+                .append(structure.isPackingEnabled() ? "enabled" : "disabled").append('\n');
+            DataTypeComponent[] components = structure.getDefinedComponents();
+            result.append("Defined Fields: ").append(components.length);
+            for (DataTypeComponent component : components) {
+                result.append("\n\nOffset: 0x")
+                    .append(Integer.toHexString(component.getOffset()).toUpperCase())
+                    .append(" (").append(component.getOffset()).append(")")
+                    .append("\nEnd Offset: 0x")
+                    .append(Integer.toHexString(component.getEndOffset()).toUpperCase())
+                    .append("\nOrdinal: ").append(component.getOrdinal())
+                    .append("\nName: ").append(component.getFieldName() == null
+                        ? "<unnamed>" : component.getFieldName())
+                    .append("\nData Type: ").append(component.getDataType().getPathName())
+                    .append("\nLength: ").append(component.getLength()).append(" bytes")
+                    .append("\nComment: ").append(component.getComment() == null
+                        ? "<none>" : normalizeStructText(component.getComment()));
+                if (component.isBitFieldComponent()) {
+                    result.append("\nBit Field: true");
+                }
+            }
+            return result.toString();
+        }
+        catch (Exception e) {
+            return formatStructError("listing struct fields", e);
+        }
+    }
+
+    private String addStructField(
+            String categoryPathText, String structName, int offset, String fieldName,
+            String dataTypeReference, int requestedLength, String comment) {
+        Program program = getCurrentProgram();
+        if (program == null) {
+            return "Error: no program loaded";
+        }
+        String validationError = validateStructReference(categoryPathText, structName);
+        if (validationError != null) {
+            return validationError;
+        }
+        if (offset < 0) {
+            return "Error: offset must be zero or greater";
+        }
+        if (fieldName == null || fieldName.isBlank()) {
+            return "Error: field_name is required";
+        }
+        if (dataTypeReference == null || dataTypeReference.isBlank()) {
+            return "Error: data_type is required";
+        }
+
+        try {
+            DataTypeManager dataTypeManager = program.getDataTypeManager();
+            Structure structure = findStructure(
+                dataTypeManager, categoryPathText, structName);
+            if (structure == null) {
+                return structNotFoundError(categoryPathText, structName);
+            }
+            if (structure.isPackingEnabled()) {
+                return "Error: add_struct_field requires a non-packed structure so the " +
+                    "requested offset remains exact: " + structure.getPathName();
+            }
+            DataType fieldDataType = resolveStructDataType(
+                dataTypeManager, dataTypeReference.trim());
+            if (fieldDataType == null) {
+                return "Error: data type not found or ambiguous: " + dataTypeReference +
+                    "; use its full path, such as /Folder/Type";
+            }
+            if (requestedLength > 0 && fieldDataType.getLength() > 0 &&
+                    requestedLength > fieldDataType.getLength()) {
+                return "Error: length cannot exceed the fixed data type size (" +
+                    fieldDataType.getLength() + " bytes); use array syntax such as " +
+                    dataTypeReference.trim() + "[" +
+                    ((requestedLength + fieldDataType.getLength() - 1) /
+                        fieldDataType.getLength()) + "]";
+            }
+            int fieldLength = resolveStructFieldLength(fieldDataType, requestedLength);
+            if (fieldLength <= 0) {
+                return "Error: length must be supplied for a dynamically sized data type";
+            }
+            String rangeError = validateStructFieldRange(
+                structure, offset, fieldLength, null);
+            if (rangeError != null) {
+                return rangeError;
+            }
+
+            int transaction = program.startTransaction("Add struct field");
+            boolean commit = false;
+            try {
+                ensureStructureLength(structure, offset, fieldLength);
+                DataTypeComponent component = structure.replaceAtOffset(
+                    offset, fieldDataType, fieldLength,
+                    fieldName.trim(), normalizeNullableStructText(comment));
+                commit = true;
+                return "Struct field added successfully\n" +
+                    formatStructComponent(structure, component);
+            }
+            finally {
+                program.endTransaction(transaction, commit);
+            }
+        }
+        catch (Exception e) {
+            return formatStructError("adding struct field", e);
+        }
+    }
+
+    private String removeStructField(
+            String categoryPathText, String structName, int offset) {
+        Program program = getCurrentProgram();
+        if (program == null) {
+            return "Error: no program loaded";
+        }
+        String validationError = validateStructReference(categoryPathText, structName);
+        if (validationError != null) {
+            return validationError;
+        }
+        if (offset < 0) {
+            return "Error: offset must be zero or greater";
+        }
+
+        try {
+            Structure structure = findStructure(
+                program.getDataTypeManager(), categoryPathText, structName);
+            if (structure == null) {
+                return structNotFoundError(categoryPathText, structName);
+            }
+            DataTypeComponent component = structure.getComponentContaining(offset);
+            if (component == null || component.isUndefined()) {
+                return "Error: no defined field contains offset 0x" +
+                    Integer.toHexString(offset).toUpperCase() + " in " +
+                    structure.getPathName();
+            }
+            int actualOffset = component.getOffset();
+            String removedName = component.getFieldName();
+            String removedType = component.getDataType().getPathName();
+            int oldLength = structure.getLength();
+
+            int transaction = program.startTransaction("Remove struct field");
+            boolean commit = false;
+            try {
+                structure.clearAtOffset(actualOffset);
+                commit = true;
+            }
+            finally {
+                program.endTransaction(transaction, commit);
+            }
+            return "Struct field removed successfully\n" +
+                "Structure: " + structure.getPathName() + "\n" +
+                "Requested Offset: 0x" + Integer.toHexString(offset).toUpperCase() + "\n" +
+                "Removed Offset: 0x" + Integer.toHexString(actualOffset).toUpperCase() + "\n" +
+                "Removed Name: " + (removedName == null ? "<unnamed>" : removedName) + "\n" +
+                "Removed Data Type: " + removedType + "\n" +
+                "Old Size: " + oldLength + " bytes\n" +
+                "New Size: " + structure.getLength() + " bytes";
+        }
+        catch (Exception e) {
+            return formatStructError("removing struct field", e);
+        }
+    }
+
+    private String modifyStructField(
+            String categoryPathText, String structName, int offset,
+            boolean hasNewOffset, int newOffset,
+            boolean hasNewName, String newName,
+            boolean hasNewDataType, String newDataTypeReference,
+            boolean hasNewLength, int newLength,
+            boolean hasNewComment, String newComment) {
+        Program program = getCurrentProgram();
+        if (program == null) {
+            return "Error: no program loaded";
+        }
+        String validationError = validateStructReference(categoryPathText, structName);
+        if (validationError != null) {
+            return validationError;
+        }
+        if (offset < 0) {
+            return "Error: offset must be zero or greater";
+        }
+        if (!hasNewOffset && !hasNewName && !hasNewDataType &&
+                !hasNewLength && !hasNewComment) {
+            return "Error: provide at least one field change";
+        }
+        if (hasNewOffset && newOffset < 0) {
+            return "Error: new_offset must be zero or greater";
+        }
+        if (hasNewLength && newLength <= 0) {
+            return "Error: new_length must be greater than zero";
+        }
+        if (hasNewDataType &&
+                (newDataTypeReference == null || newDataTypeReference.isBlank())) {
+            return "Error: new_data_type cannot be blank";
+        }
+
+        try {
+            DataTypeManager dataTypeManager = program.getDataTypeManager();
+            Structure structure = findStructure(
+                dataTypeManager, categoryPathText, structName);
+            if (structure == null) {
+                return structNotFoundError(categoryPathText, structName);
+            }
+            DataTypeComponent original = structure.getComponentContaining(offset);
+            if (original == null || original.isUndefined()) {
+                return "Error: no defined field contains offset 0x" +
+                    Integer.toHexString(offset).toUpperCase() + " in " +
+                    structure.getPathName();
+            }
+
+            boolean layoutChange = hasNewOffset || hasNewDataType || hasNewLength;
+            if (layoutChange && structure.isPackingEnabled()) {
+                return "Error: offset, type, or length changes require a non-packed " +
+                    "structure: " + structure.getPathName();
+            }
+            if (layoutChange && original.isBitFieldComponent()) {
+                return "Error: changing the layout of bit fields is not supported";
+            }
+
+            DataType targetDataType = original.getDataType();
+            if (hasNewDataType) {
+                targetDataType = resolveStructDataType(
+                    dataTypeManager, newDataTypeReference.trim());
+                if (targetDataType == null) {
+                    return "Error: data type not found or ambiguous: " +
+                        newDataTypeReference + "; use its full path";
+                }
+            }
+            if (hasNewLength && targetDataType.getLength() > 0 &&
+                    newLength > targetDataType.getLength()) {
+                return "Error: new_length cannot exceed the fixed data type size (" +
+                    targetDataType.getLength() + " bytes); use array syntax in " +
+                    "new_data_type instead";
+            }
+            int targetLength = hasNewLength
+                ? newLength
+                : (hasNewDataType
+                    ? resolveStructFieldLength(targetDataType, -1)
+                    : original.getLength());
+            if (targetLength <= 0) {
+                return "Error: new_length is required for a dynamically sized data type";
+            }
+            int targetOffset = hasNewOffset ? newOffset : original.getOffset();
+            String targetName = hasNewName
+                ? normalizeNullableStructText(newName) : original.getFieldName();
+            String targetComment = hasNewComment
+                ? normalizeNullableStructText(newComment) : original.getComment();
+
+            if (layoutChange) {
+                String rangeError = validateStructFieldRange(
+                    structure, targetOffset, targetLength, original);
+                if (rangeError != null) {
+                    return rangeError;
+                }
+            }
+
+            int oldOffset = original.getOffset();
+            String oldName = original.getFieldName();
+            String oldType = original.getDataType().getPathName();
+            int transaction = program.startTransaction("Modify struct field");
+            boolean commit = false;
+            DataTypeComponent modified;
+            try {
+                if (layoutChange) {
+                    structure.clearAtOffset(oldOffset);
+                    ensureStructureLength(structure, targetOffset, targetLength);
+                    modified = structure.replaceAtOffset(
+                        targetOffset, targetDataType, targetLength,
+                        targetName, targetComment);
+                }
+                else {
+                    modified = original;
+                    if (hasNewName) {
+                        modified = modified.setFieldName(targetName);
+                    }
+                    if (hasNewComment) {
+                        modified = modified.setComment(targetComment);
+                    }
+                }
+                commit = true;
+            }
+            finally {
+                program.endTransaction(transaction, commit);
+            }
+            return "Struct field modified successfully\n" +
+                "Old Offset: 0x" + Integer.toHexString(oldOffset).toUpperCase() + "\n" +
+                "Old Name: " + (oldName == null ? "<unnamed>" : oldName) + "\n" +
+                "Old Data Type: " + oldType + "\n" +
+                formatStructComponent(structure, modified);
+        }
+        catch (Exception e) {
+            return formatStructError("modifying struct field", e);
+        }
+    }
+
+    private String modifyStruct(
+            String categoryPathText, String structName,
+            boolean hasNewName, String newName, boolean hasNewSize, int newSize) {
+        Program program = getCurrentProgram();
+        if (program == null) {
+            return "Error: no program loaded";
+        }
+        String validationError = validateStructReference(categoryPathText, structName);
+        if (validationError != null) {
+            return validationError;
+        }
+        if (!hasNewName && !hasNewSize) {
+            return "Error: provide new_name and/or new_size";
+        }
+        if (hasNewName && (newName == null || newName.isBlank())) {
+            return "Error: new_name cannot be blank";
+        }
+        if (hasNewSize && newSize < 0) {
+            return "Error: new_size must be zero or greater";
+        }
+
+        try {
+            Structure structure = findStructure(
+                program.getDataTypeManager(), categoryPathText, structName);
+            if (structure == null) {
+                return structNotFoundError(categoryPathText, structName);
+            }
+            if (hasNewSize && structure.isPackingEnabled() &&
+                    newSize != structure.getLength()) {
+                return "Error: packed structures cannot be resized explicitly: " +
+                    structure.getPathName();
+            }
+            String oldPath = structure.getPathName();
+            int oldSize = structure.getLength();
+
+            int transaction = program.startTransaction("Modify struct");
+            boolean commit = false;
+            try {
+                if (hasNewName) {
+                    structure.setName(newName.trim());
+                }
+                if (hasNewSize) {
+                    structure.setLength(newSize);
+                }
+                commit = true;
+            }
+            finally {
+                program.endTransaction(transaction, commit);
+            }
+            return "Structure modified successfully\n" +
+                "Old Path: " + oldPath + "\n" +
+                "New Path: " + structure.getPathName() + "\n" +
+                "Old Size: " + oldSize + " bytes\n" +
+                "New Size: " + structure.getLength() + " bytes\n" +
+                "Defined Fields: " + structure.getNumDefinedComponents();
+        }
+        catch (Exception e) {
+            return formatStructError("modifying structure", e);
+        }
+    }
+
+    private String validateStructReference(String categoryPathText, String structName) {
+        if (categoryPathText == null || categoryPathText.isBlank()) {
+            return "Error: category_path is required; use / for the root folder";
+        }
+        if (structName == null || structName.isBlank()) {
+            return "Error: struct_name is required";
+        }
+        if (categoryPathText.indexOf('\n') >= 0 || categoryPathText.indexOf('\r') >= 0 ||
+                structName.indexOf('\n') >= 0 || structName.indexOf('\r') >= 0) {
+            return "Error: category_path and struct_name must be single-line values";
+        }
+        return null;
+    }
+
+    private Structure findStructure(
+            DataTypeManager dataTypeManager, String categoryPathText, String structName) {
+        CategoryPath categoryPath = new CategoryPath(normalizeCategoryPath(categoryPathText));
+        DataType dataType = dataTypeManager.getDataType(categoryPath, structName.trim());
+        return dataType instanceof Structure structure ? structure : null;
+    }
+
+    private String structNotFoundError(String categoryPathText, String structName) {
+        String categoryPath = normalizeCategoryPath(categoryPathText);
+        return "Error: structure not found at " +
+            ("/".equals(categoryPath) ? categoryPath : categoryPath + "/") +
+            structName.trim();
+    }
+
+    private String normalizeCategoryPath(String categoryPathText) {
+        String path = categoryPathText.trim().replace('\\', '/');
+        if (!path.startsWith("/")) {
+            path = "/" + path;
+        }
+        while (path.length() > 1 && path.endsWith("/")) {
+            path = path.substring(0, path.length() - 1);
+        }
+        return path;
+    }
+
+    private DataType resolveStructDataType(
+            DataTypeManager dataTypeManager, String reference) {
+        String typeReference = reference.trim();
+        int arrayStart = typeReference.lastIndexOf('[');
+        if (arrayStart > 0 && typeReference.endsWith("]")) {
+            try {
+                int elementCount = Integer.parseInt(
+                    typeReference.substring(arrayStart + 1, typeReference.length() - 1));
+                DataType elementType = resolveStructDataType(
+                    dataTypeManager, typeReference.substring(0, arrayStart));
+                if (elementCount <= 0 || elementType == null || elementType.getLength() <= 0) {
+                    return null;
+                }
+                return new ArrayDataType(
+                    elementType, elementCount, elementType.getLength(), dataTypeManager);
+            }
+            catch (NumberFormatException e) {
+                return null;
+            }
+        }
+        if (typeReference.endsWith("*")) {
+            DataType pointedTo = resolveStructDataType(
+                dataTypeManager,
+                typeReference.substring(0, typeReference.length() - 1));
+            return pointedTo == null ? null : dataTypeManager.getPointer(pointedTo);
+        }
+        if (typeReference.startsWith("/")) {
+            return dataTypeManager.getDataType(typeReference);
+        }
+
+        List<DataType> matches = new ArrayList<>();
+        Iterator<DataType> allTypes = dataTypeManager.getAllDataTypes();
+        while (allTypes.hasNext()) {
+            DataType candidate = allTypes.next();
+            if (candidate.getName().equalsIgnoreCase(typeReference)) {
+                matches.add(candidate);
+            }
+        }
+        if (matches.size() == 1) {
+            return matches.get(0);
+        }
+        if (matches.size() > 1) {
+            return null;
+        }
+        return switch (typeReference.toLowerCase()) {
+            case "int", "long" -> dataTypeManager.getDataType("/int");
+            case "uint", "unsigned int", "unsigned long", "dword" ->
+                dataTypeManager.getDataType("/uint");
+            case "short" -> dataTypeManager.getDataType("/short");
+            case "ushort", "unsigned short", "word" ->
+                dataTypeManager.getDataType("/ushort");
+            case "char", "byte" -> dataTypeManager.getDataType("/char");
+            case "uchar", "unsigned char" -> dataTypeManager.getDataType("/uchar");
+            case "longlong", "__int64" -> dataTypeManager.getDataType("/longlong");
+            case "ulonglong", "unsigned __int64", "qword" ->
+                dataTypeManager.getDataType("/ulonglong");
+            case "bool", "boolean" -> dataTypeManager.getDataType("/bool");
+            default -> null;
+        };
+    }
+
+    private int resolveStructFieldLength(DataType dataType, int requestedLength) {
+        if (requestedLength == 0 || requestedLength < -1) {
+            return -1;
+        }
+        return requestedLength > 0 ? requestedLength : dataType.getLength();
+    }
+
+    private String validateStructFieldRange(
+            Structure structure, int offset, int length, DataTypeComponent ignoredComponent) {
+        long end = (long) offset + length - 1L;
+        if (end > Integer.MAX_VALUE) {
+            return "Error: field range exceeds the maximum structure offset";
+        }
+        for (DataTypeComponent component : structure.getDefinedComponents()) {
+            if (ignoredComponent != null &&
+                    component.getOrdinal() == ignoredComponent.getOrdinal() &&
+                    component.getOffset() == ignoredComponent.getOffset()) {
+                continue;
+            }
+            long componentEnd = Math.max(
+                component.getOffset(), component.getEndOffset());
+            if (offset <= componentEnd && component.getOffset() <= end) {
+                return "Error: struct field range conflict\n" +
+                    "Requested Range: 0x" + Integer.toHexString(offset).toUpperCase() +
+                        " - 0x" + Long.toHexString(end).toUpperCase() + "\n" +
+                    "Conflict Offset: 0x" +
+                        Integer.toHexString(component.getOffset()).toUpperCase() + "\n" +
+                    "Conflict Range: 0x" +
+                        Integer.toHexString(component.getOffset()).toUpperCase() +
+                        " - 0x" +
+                        Integer.toHexString(component.getEndOffset()).toUpperCase() + "\n" +
+                    "Conflict Field: " + (component.getFieldName() == null
+                        ? "<unnamed>" : component.getFieldName()) + "\n" +
+                    "Conflict Data Type: " + component.getDataType().getPathName();
+            }
+        }
+        return null;
+    }
+
+    private void ensureStructureLength(Structure structure, int offset, int fieldLength) {
+        long requiredLength = (long) offset + fieldLength;
+        if (requiredLength > Integer.MAX_VALUE) {
+            throw new IllegalArgumentException("field exceeds maximum structure size");
+        }
+        if (structure.getLength() < requiredLength) {
+            structure.setLength((int) requiredLength);
+        }
+    }
+
+    private String formatStructComponent(
+            Structure structure, DataTypeComponent component) {
+        return "Structure: " + structure.getPathName() + "\n" +
+            "Structure Size: " + structure.getLength() + " bytes\n" +
+            "Offset: 0x" + Integer.toHexString(component.getOffset()).toUpperCase() + "\n" +
+            "End Offset: 0x" +
+                Integer.toHexString(component.getEndOffset()).toUpperCase() + "\n" +
+            "Name: " + (component.getFieldName() == null
+                ? "<unnamed>" : component.getFieldName()) + "\n" +
+            "Data Type: " + component.getDataType().getPathName() + "\n" +
+            "Length: " + component.getLength() + " bytes\n" +
+            "Comment: " + (component.getComment() == null
+                ? "<none>" : normalizeStructText(component.getComment()));
+    }
+
+    private String normalizeStructText(String value) {
+        return value.replace('\r', ' ').replace('\n', ' ').trim();
+    }
+
+    private String normalizeNullableStructText(String value) {
+        if (value == null || value.isBlank()) {
+            return null;
+        }
+        return normalizeStructText(value);
+    }
+
+    private String formatStructError(String operation, Exception exception) {
+        Msg.error(this, "Error " + operation, exception);
+        String message = exception.getMessage();
+        return "Error " + operation + ": " +
+            (message == null || message.isBlank()
+                ? exception.getClass().getSimpleName() : message);
     }
 
     private String formatGlobalDataResult(String status, Data data, Symbol labelSymbol) {

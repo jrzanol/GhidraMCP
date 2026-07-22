@@ -419,6 +419,209 @@ def delete_global_data(location: str) -> str:
 
     return safe_post("delete_global_data", {"location": location})
 
+def _validate_struct_reference(category_path: str, struct_name: str) -> str | None:
+    if not category_path or not category_path.strip():
+        return "Error: category_path is required; use / for the root folder"
+    if not struct_name or not struct_name.strip():
+        return "Error: struct_name is required"
+    if any(c in category_path or c in struct_name for c in ("\n", "\r")):
+        return "Error: category_path and struct_name must be single-line values"
+    return None
+
+@mcp.tool()
+def list_struct_fields(category_path: str, struct_name: str) -> list:
+    """
+    List the defined fields of a structure in a specific Data Type Manager folder.
+
+    Args:
+        category_path: Folder path, such as ``/TM/Network`` or ``/`` for root.
+        struct_name: Exact structure name in that folder.
+    """
+    error = _validate_struct_reference(category_path, struct_name)
+    if error:
+        return [error]
+    return safe_get("struct_fields", {
+        "category_path": category_path.strip(),
+        "struct_name": struct_name.strip(),
+    })
+
+@mcp.tool()
+def add_struct_field(
+    category_path: str,
+    struct_name: str,
+    offset: int,
+    field_name: str,
+    data_type: str,
+    length: int = -1,
+    comment: str = "",
+) -> str:
+    """
+    Add a field at an exact offset in a folder-qualified, non-packed structure.
+
+    Existing fields are never shifted or overwritten. The structure grows when
+    needed. Data types may use a full path, pointer suffix, or array syntax such as
+    ``/TM/Types/Item *`` or ``DWORD[10]``.
+
+    Args:
+        category_path: Data Type Manager folder containing the structure.
+        struct_name: Exact structure name.
+        offset: Field byte offset, zero or greater.
+        field_name: New field name.
+        data_type: Field data type name or full path.
+        length: Explicit byte length for dynamic types; ``-1`` uses natural size.
+        comment: Optional field comment.
+    """
+    error = _validate_struct_reference(category_path, struct_name)
+    if error:
+        return error
+    if offset < 0:
+        return "Error: offset must be zero or greater"
+    if not field_name or not field_name.strip():
+        return "Error: field_name is required"
+    if not data_type or not data_type.strip():
+        return "Error: data_type is required"
+    if length == 0 or length < -1:
+        return "Error: length must be -1 or greater than zero"
+    return safe_post("add_struct_field", {
+        "category_path": category_path.strip(),
+        "struct_name": struct_name.strip(),
+        "offset": str(offset),
+        "field_name": field_name.strip(),
+        "data_type": data_type.strip(),
+        "length": str(length),
+        "comment": comment,
+    })
+
+@mcp.tool()
+def remove_struct_field(
+    category_path: str,
+    struct_name: str,
+    offset: int,
+) -> str:
+    """
+    Remove the defined structure field containing an offset.
+
+    For a non-packed structure the field becomes undefined space and the overall
+    structure size is preserved.
+
+    Args:
+        category_path: Data Type Manager folder containing the structure.
+        struct_name: Exact structure name.
+        offset: Start of the field or any byte inside it.
+    """
+    error = _validate_struct_reference(category_path, struct_name)
+    if error:
+        return error
+    if offset < 0:
+        return "Error: offset must be zero or greater"
+    return safe_post("remove_struct_field", {
+        "category_path": category_path.strip(),
+        "struct_name": struct_name.strip(),
+        "offset": str(offset),
+    })
+
+@mcp.tool()
+def modify_struct_field(
+    category_path: str,
+    struct_name: str,
+    offset: int,
+    new_offset: int | None = None,
+    new_name: str | None = None,
+    new_data_type: str | None = None,
+    new_length: int | None = None,
+    new_comment: str | None = None,
+) -> str:
+    """
+    Modify a structure field's offset, name, data type, length, and/or comment.
+
+    Omitted values remain unchanged. An empty ``new_name`` clears the field name,
+    and an empty ``new_comment`` clears the comment. Layout changes do not overwrite
+    another field and require a non-packed structure.
+
+    Args:
+        category_path: Data Type Manager folder containing the structure.
+        struct_name: Exact structure name.
+        offset: Start or interior byte of the existing field.
+        new_offset: Optional new byte offset.
+        new_name: Optional new name; empty clears it.
+        new_data_type: Optional type name or full path.
+        new_length: Optional new byte length.
+        new_comment: Optional comment; empty clears it.
+    """
+    error = _validate_struct_reference(category_path, struct_name)
+    if error:
+        return error
+    if offset < 0:
+        return "Error: offset must be zero or greater"
+    changes = (new_offset, new_name, new_data_type, new_length, new_comment)
+    if all(value is None for value in changes):
+        return "Error: provide at least one field change"
+    if new_offset is not None and new_offset < 0:
+        return "Error: new_offset must be zero or greater"
+    if new_length is not None and new_length <= 0:
+        return "Error: new_length must be greater than zero"
+    if new_data_type is not None and not new_data_type.strip():
+        return "Error: new_data_type cannot be blank"
+
+    data = {
+        "category_path": category_path.strip(),
+        "struct_name": struct_name.strip(),
+        "offset": str(offset),
+    }
+    if new_offset is not None:
+        data.update({"has_new_offset": "true", "new_offset": str(new_offset)})
+    if new_name is not None:
+        data.update({"has_new_name": "true", "new_name": new_name})
+    if new_data_type is not None:
+        data.update({
+            "has_new_data_type": "true",
+            "new_data_type": new_data_type.strip(),
+        })
+    if new_length is not None:
+        data.update({"has_new_length": "true", "new_length": str(new_length)})
+    if new_comment is not None:
+        data.update({"has_new_comment": "true", "new_comment": new_comment})
+    return safe_post("modify_struct_field", data)
+
+@mcp.tool()
+def modify_struct(
+    category_path: str,
+    struct_name: str,
+    new_name: str | None = None,
+    new_size: int | None = None,
+) -> str:
+    """
+    Rename and/or resize a structure in a specific Data Type Manager folder.
+
+    Shrinking may remove fields that no longer fit. Explicit resizing is rejected
+    for packed structures because their size is determined by packing.
+
+    Args:
+        category_path: Data Type Manager folder containing the structure.
+        struct_name: Current exact structure name.
+        new_name: Optional new structure name.
+        new_size: Optional new total size in bytes, zero or greater.
+    """
+    error = _validate_struct_reference(category_path, struct_name)
+    if error:
+        return error
+    if new_name is None and new_size is None:
+        return "Error: provide new_name and/or new_size"
+    if new_name is not None and not new_name.strip():
+        return "Error: new_name cannot be blank"
+    if new_size is not None and new_size < 0:
+        return "Error: new_size must be zero or greater"
+
+    data = {
+        "category_path": category_path.strip(),
+        "struct_name": struct_name.strip(),
+    }
+    if new_name is not None:
+        data.update({"has_new_name": "true", "new_name": new_name.strip()})
+    if new_size is not None:
+        data.update({"has_new_size": "true", "new_size": str(new_size)})
+    return safe_post("modify_struct", data)
+
 @mcp.tool()
 def list_strings(offset: int = 0, limit: int = 2000, filter: str = None) -> list:
     """

@@ -301,6 +301,91 @@ To register an exportable global with a specific label, type, and size, call
 `register_global_data` first and then call `add_bookmark` at the same address with
 the desired category. Repeating an identical bookmark request makes no changes.
 
+## Structures in the Data Type Manager
+
+All structure tools identify the target with both `category_path` and
+`struct_name`. This avoids ambiguity when different Data Type Manager folders
+contain structures with the same name. Use `/` for the root folder or a complete
+folder path such as `/TM/Network`.
+
+Field data types may also use a complete path. Pointer and array suffixes are
+supported, including `/TM/Types/Item *`, `/TM/Types/Item[10]`, and `DWORD[10]`.
+When an unqualified data type name exists in more than one folder, the tool
+returns an ambiguity error and requires the full path.
+
+### `list_struct_fields`
+
+Lists every defined field in a structure, including its offset, end offset,
+ordinal, name, full data type path, byte length, comment, and bit-field status. It
+also reports the total structure size and whether packing is enabled.
+
+- Parameters: `category_path` and `struct_name`.
+- Example:
+  `{"category_path": "/TM/Network", "struct_name": "PacketHeader"}`
+
+### `add_struct_field`
+
+Adds a field at an exact byte offset. Existing fields are not shifted or
+overwritten; a collision returns both the requested and conflicting ranges. The
+structure grows automatically when the new field extends past its current end.
+
+- Parameters: `category_path`, `struct_name`, `offset`, `field_name`, `data_type`,
+  optional `length` (default `-1`, natural size), and optional `comment`.
+- Built-in type example:
+  `{"category_path": "/TM/Network", "struct_name": "PacketHeader", "offset": 8, "field_name": "itemCount", "data_type": "DWORD", "comment": "Number of items"}`
+- Array example:
+  `{"category_path": "/TM/Network", "struct_name": "PacketHeader", "offset": 12, "field_name": "itemIds", "data_type": "DWORD[10]"}`
+
+Explicit-offset addition requires a non-packed structure. For a dynamically sized
+type, supply a positive `length`. For a fixed type, use array syntax instead of a
+length greater than the type's natural size.
+
+### `remove_struct_field`
+
+Removes the defined field containing an offset. The offset may point to the first
+byte or any byte inside the field. In a non-packed structure, the removed field
+becomes undefined space and the total structure size is preserved.
+
+- Parameters: `category_path`, `struct_name`, and `offset`.
+- Example:
+  `{"category_path": "/TM/Network", "struct_name": "PacketHeader", "offset": 12}`
+
+### `modify_struct_field`
+
+Changes one or more properties of an existing field: offset, name, data type,
+length, or comment. Omitted properties remain unchanged. Passing an empty string
+as `new_name` or `new_comment` clears that property. The original field is restored
+automatically if any part of the transaction fails.
+
+- Required parameters: `category_path`, `struct_name`, and `offset`.
+- Optional changes: `new_offset`, `new_name`, `new_data_type`, `new_length`, and
+  `new_comment`.
+- Rename and comment example:
+  `{"category_path": "/TM/Network", "struct_name": "PacketHeader", "offset": 8, "new_name": "entryCount", "new_comment": "Validated entry count"}`
+- Move and replace example:
+  `{"category_path": "/TM/Network", "struct_name": "PacketHeader", "offset": 12, "new_offset": 16, "new_data_type": "/TM/Types/Item[10]"}`
+
+Moving a field or changing its type/length requires a non-packed structure. The
+operation refuses to overlap another field and reports the exact conflicting
+offset and range. Layout changes for bit fields are intentionally rejected;
+their name and comment can still be changed.
+
+### `modify_struct`
+
+Renames and/or resizes a structure in a specific folder. Existing uses of the
+managed structure continue to reference the updated data type.
+
+- Required parameters: `category_path` and `struct_name`.
+- Provide `new_name`, `new_size`, or both.
+- Rename example:
+  `{"category_path": "/TM/Network", "struct_name": "PacketHeader", "new_name": "TM_PacketHeader"}`
+- Resize example:
+  `{"category_path": "/TM/Network", "struct_name": "TM_PacketHeader", "new_size": 64}`
+
+Shrinking a structure removes fields that no longer fit, so use `list_struct_fields`
+first when reducing its size. Packed structures may be renamed but cannot be
+resized explicitly because their size is controlled by packing.
+
 ## Script Execution
 
 ### `execute_ghidra_script`
