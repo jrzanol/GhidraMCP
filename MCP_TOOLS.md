@@ -313,6 +313,28 @@ supported, including `/TM/Types/Item *`, `/TM/Types/Item[10]`, and `DWORD[10]`.
 When an unqualified data type name exists in more than one folder, the tool
 returns an ambiguity error and requires the full path.
 
+### `create_struct`
+
+Creates a new structure at an exact Data Type Manager folder path. The operation
+refuses to overwrite any existing data type with the same name. It may optionally
+create the target folder, and the folder and structure are created in the same
+transaction.
+
+- Required parameters: `category_path` and `struct_name`.
+- Optional parameters: `initial_size` (default `0`), `packing` (default
+  `disabled`), `packing_value`, `description`, and `create_category` (default
+  `false`).
+- Non-packed example:
+  `{"category_path": "/TM/Network", "struct_name": "PacketState", "initial_size": 32, "description": "Per-connection packet state", "create_category": true}`
+- Explicitly packed example:
+  `{"category_path": "/TMBasedef.h", "struct_name": "STRUCT_NEW_DATA", "packing": "explicit", "packing_value": 1, "description": "New server data structure"}`
+
+`packing` accepts `disabled`, `default`, or `explicit`. Explicit packing requires a
+positive `packing_value`. Packed structures must use `initial_size: 0` because
+their size is derived from their fields. An empty, non-packed Ghidra structure
+created with requested size `0` may report a one-byte not-yet-defined size until a
+field is added; the result includes both requested and current size.
+
 ### `list_struct_fields`
 
 Lists every defined field in a structure, including its offset, end offset,
@@ -325,20 +347,28 @@ also reports the total structure size and whether packing is enabled.
 
 ### `add_struct_field`
 
-Adds a field at an exact byte offset. Existing fields are not shifted or
-overwritten; a collision returns both the requested and conflicting ranges. The
-structure grows automatically when the new field extends past its current end.
+Adds a field using one of two placement modes. For a non-packed structure, use an
+exact byte `offset`; existing fields are not shifted or overwritten and the
+structure grows when needed. For a packed structure, use an insertion `ordinal`;
+Ghidra calculates the field offset and repacks subsequent fields.
 
-- Parameters: `category_path`, `struct_name`, `offset`, `field_name`, `data_type`,
-  optional `length` (default `-1`, natural size), and optional `comment`.
+- Required parameters: `category_path`, `struct_name`, `field_name`, and
+  `data_type`.
+- Placement: provide exactly one of `offset` or `ordinal`.
+- Optional parameters: `length` (default `-1`, natural size), `comment`, and
+  `allow_repack` (default `false`).
 - Built-in type example:
   `{"category_path": "/TM/Network", "struct_name": "PacketHeader", "offset": 8, "field_name": "itemCount", "data_type": "DWORD", "comment": "Number of items"}`
 - Array example:
   `{"category_path": "/TM/Network", "struct_name": "PacketHeader", "offset": 12, "field_name": "itemIds", "data_type": "DWORD[10]"}`
+- Packed insertion preview:
+  `{"category_path": "/TMBasedef.h", "struct_name": "STRUCT_ITEM", "ordinal": 3, "field_name": "NewValue", "data_type": "DWORD"}`
 
-Explicit-offset addition requires a non-packed structure. For a dynamically sized
-type, supply a positive `length`. For a fixed type, use array syntax instead of a
-length greater than the type's natural size.
+Packed insertion is transactional. Without `allow_repack`, the result previews the
+new total size, actual inserted offset, and every existing field whose offset would
+change, then rolls back. Repeat the same request with `"allow_repack": true` to
+commit. For a dynamically sized type, supply a positive `length`. For a fixed
+type, use array syntax instead of a length greater than the natural size.
 
 ### `remove_struct_field`
 
@@ -360,15 +390,32 @@ automatically if any part of the transaction fails.
 - Required parameters: `category_path`, `struct_name`, and `offset`.
 - Optional changes: `new_offset`, `new_name`, `new_data_type`, `new_length`, and
   `new_comment`.
+- Packed-layout confirmation: `allow_repack` (default `false`).
 - Rename and comment example:
   `{"category_path": "/TM/Network", "struct_name": "PacketHeader", "offset": 8, "new_name": "entryCount", "new_comment": "Validated entry count"}`
 - Move and replace example:
   `{"category_path": "/TM/Network", "struct_name": "PacketHeader", "offset": 12, "new_offset": 16, "new_data_type": "/TM/Types/Item[10]"}`
+- Safe packed-structure retype:
+  `{"category_path": "/TMBasedef.h", "struct_name": "STRUCT_ITEM", "offset": 12, "new_data_type": "/TMBasedef.h/STRUCT_ITEMLIST"}`
 
-Moving a field or changing its type/length requires a non-packed structure. The
-operation refuses to overlap another field and reports the exact conflicting
-offset and range. Layout changes for bit fields are intentionally rejected;
-their name and comment can still be changed.
+For a non-packed structure, moving or replacing a field refuses to overlap another
+field and reports the exact conflicting offset and range. For a packed structure,
+`new_offset` is rejected because packing determines offsets. Type and length
+changes are applied by component ordinal inside a transaction, then the complete
+layout is compared with the original layout. If no field offset or total structure
+size changes, the retype is committed automatically.
+
+If the packed replacement would move fields or change the total size, the
+transaction is rolled back and the result reports the proposed size and every
+changed offset. Review that preview and repeat the same call with
+`"allow_repack": true` to commit deliberately:
+
+`{"category_path": "/TMBasedef.h", "struct_name": "STRUCT_ITEM", "offset": 12, "new_data_type": "DWORD[10]", "allow_repack": true}`
+
+This workflow allows the structures exported by `ExportTMBasedef.java` to be
+retyped directly in Ghidra without a manual post-generation merge. Layout changes
+for bit fields remain intentionally rejected; their name and comment can still be
+changed.
 
 ### `modify_struct`
 

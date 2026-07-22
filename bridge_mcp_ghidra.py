@@ -446,51 +446,118 @@ def list_struct_fields(category_path: str, struct_name: str) -> list:
     })
 
 @mcp.tool()
-def add_struct_field(
+def create_struct(
     category_path: str,
     struct_name: str,
-    offset: int,
-    field_name: str,
-    data_type: str,
-    length: int = -1,
-    comment: str = "",
+    initial_size: int = 0,
+    packing: str = "disabled",
+    packing_value: int | None = None,
+    description: str = "",
+    create_category: bool = False,
 ) -> str:
     """
-    Add a field at an exact offset in a folder-qualified, non-packed structure.
+    Create a new structure in a specific Data Type Manager folder.
 
-    Existing fields are never shifted or overwritten. The structure grows when
-    needed. Data types may use a full path, pointer suffix, or array syntax such as
-    ``/TM/Types/Item *`` or ``DWORD[10]``.
+    Packing may be ``disabled``, ``default``, or ``explicit``. Packed structures
+    must start at size zero because their size is derived from fields. Duplicate
+    data type names at the target path are rejected.
 
     Args:
-        category_path: Data Type Manager folder containing the structure.
-        struct_name: Exact structure name.
-        offset: Field byte offset, zero or greater.
-        field_name: New field name.
-        data_type: Field data type name or full path.
-        length: Explicit byte length for dynamic types; ``-1`` uses natural size.
-        comment: Optional field comment.
+        category_path: Target Data Type Manager folder.
+        struct_name: New exact structure name.
+        initial_size: Initial bytes for a non-packed structure.
+        packing: ``disabled``, ``default``, or ``explicit``.
+        packing_value: Positive packing value required by ``explicit``.
+        description: Optional structure description.
+        create_category: Create the folder when it does not exist.
     """
     error = _validate_struct_reference(category_path, struct_name)
     if error:
         return error
-    if offset < 0:
+    if not 0 <= initial_size <= 64 * 1024 * 1024:
+        return "Error: initial_size must be between 0 and 67108864 bytes"
+    packing = packing.strip().lower() if packing else "disabled"
+    if packing not in {"disabled", "default", "explicit"}:
+        return "Error: packing must be disabled, default, or explicit"
+    if packing != "disabled" and initial_size != 0:
+        return "Error: initial_size must be 0 for packed structures"
+    if packing == "explicit" and (packing_value is None or packing_value <= 0):
+        return "Error: packing_value must be greater than zero for explicit packing"
+    if packing != "explicit" and packing_value is not None:
+        return "Error: packing_value is only valid with explicit packing"
+
+    data = {
+        "category_path": category_path.strip(),
+        "struct_name": struct_name.strip(),
+        "initial_size": str(initial_size),
+        "packing": packing,
+        "description": description,
+        "create_category": str(create_category).lower(),
+    }
+    if packing_value is not None:
+        data["packing_value"] = str(packing_value)
+    return safe_post("create_struct", data)
+
+@mcp.tool()
+def add_struct_field(
+    category_path: str,
+    struct_name: str,
+    field_name: str,
+    data_type: str,
+    offset: int | None = None,
+    ordinal: int | None = None,
+    length: int = -1,
+    comment: str = "",
+    allow_repack: bool = False,
+) -> str:
+    """
+    Add a field to a folder-qualified structure.
+
+    Use ``offset`` for a non-packed structure. Use ``ordinal`` for a packed
+    structure; the first call previews and rolls back repacking unless
+    ``allow_repack`` is true. Data types may use a full path, pointer suffix, or
+    array syntax such as ``/TM/Types/Item *`` or ``DWORD[10]``.
+
+    Args:
+        category_path: Data Type Manager folder containing the structure.
+        struct_name: Exact structure name.
+        field_name: New field name.
+        data_type: Field data type name or full path.
+        offset: Exact byte offset for a non-packed structure.
+        ordinal: Insertion ordinal for a packed structure.
+        length: Explicit byte length for dynamic types; ``-1`` uses natural size.
+        comment: Optional field comment.
+        allow_repack: Explicitly commit packed insertion and layout changes.
+    """
+    error = _validate_struct_reference(category_path, struct_name)
+    if error:
+        return error
+    if (offset is None) == (ordinal is None):
+        return "Error: provide exactly one of offset or ordinal"
+    if offset is not None and offset < 0:
         return "Error: offset must be zero or greater"
+    if ordinal is not None and ordinal < 0:
+        return "Error: ordinal must be zero or greater"
     if not field_name or not field_name.strip():
         return "Error: field_name is required"
     if not data_type or not data_type.strip():
         return "Error: data_type is required"
     if length == 0 or length < -1:
         return "Error: length must be -1 or greater than zero"
-    return safe_post("add_struct_field", {
+    data = {
         "category_path": category_path.strip(),
         "struct_name": struct_name.strip(),
-        "offset": str(offset),
         "field_name": field_name.strip(),
         "data_type": data_type.strip(),
         "length": str(length),
         "comment": comment,
-    })
+        "allow_repack": str(allow_repack).lower(),
+    }
+    if offset is not None:
+        data["offset"] = str(offset)
+    if ordinal is not None:
+        data["ordinal"] = str(ordinal)
+    return safe_post("add_struct_field", data)
 
 @mcp.tool()
 def remove_struct_field(
@@ -530,13 +597,16 @@ def modify_struct_field(
     new_data_type: str | None = None,
     new_length: int | None = None,
     new_comment: str | None = None,
+    allow_repack: bool = False,
 ) -> str:
     """
     Modify a structure field's offset, name, data type, length, and/or comment.
 
     Omitted values remain unchanged. An empty ``new_name`` clears the field name,
     and an empty ``new_comment`` clears the comment. Layout changes do not overwrite
-    another field and require a non-packed structure.
+    another field. Packed structures support type/length replacement by ordinal.
+    If that replacement changes any field offset or the total size, the tool rolls
+    back unless ``allow_repack`` is true.
 
     Args:
         category_path: Data Type Manager folder containing the structure.
@@ -547,6 +617,7 @@ def modify_struct_field(
         new_data_type: Optional type name or full path.
         new_length: Optional new byte length.
         new_comment: Optional comment; empty clears it.
+        allow_repack: Explicitly commit packed-layout offset/size changes.
     """
     error = _validate_struct_reference(category_path, struct_name)
     if error:
@@ -567,6 +638,7 @@ def modify_struct_field(
         "category_path": category_path.strip(),
         "struct_name": struct_name.strip(),
         "offset": str(offset),
+        "allow_repack": str(allow_repack).lower(),
     }
     if new_offset is not None:
         data.update({"has_new_offset": "true", "new_offset": str(new_offset)})

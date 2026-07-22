@@ -44,7 +44,9 @@ import ghidra.program.model.data.PointerDataType;
 import ghidra.program.model.data.Undefined1DataType;
 import ghidra.program.model.data.CategoryPath;
 import ghidra.program.model.data.DataTypeComponent;
+import ghidra.program.model.data.DataTypeConflictHandler;
 import ghidra.program.model.data.Structure;
+import ghidra.program.model.data.StructureDataType;
 import ghidra.program.model.listing.Variable;
 import ghidra.app.decompiler.component.DecompilerUtils;
 import ghidra.app.decompiler.ClangToken;
@@ -440,6 +442,21 @@ public class GhidraMCPPlugin extends Plugin {
                 params.get("category_path"), params.get("struct_name")));
         });
 
+        server.createContext("/create_struct", exchange -> {
+            if (!validateBridgeMutationRequest(exchange, "structure creation")) {
+                return;
+            }
+            Map<String, String> params = parsePostParams(exchange);
+            sendResponse(exchange, createStruct(
+                params.get("category_path"),
+                params.get("struct_name"),
+                parseIntOrDefault(params.get("initial_size"), 0),
+                params.get("packing"),
+                parseIntOrDefault(params.get("packing_value"), -1),
+                params.get("description"),
+                Boolean.parseBoolean(params.getOrDefault("create_category", "false"))));
+        });
+
         server.createContext("/add_struct_field", exchange -> {
             if (!validateBridgeMutationRequest(exchange, "struct field addition")) {
                 return;
@@ -449,10 +466,12 @@ public class GhidraMCPPlugin extends Plugin {
                 params.get("category_path"),
                 params.get("struct_name"),
                 parseIntOrDefault(params.get("offset"), -1),
+                parseIntOrDefault(params.get("ordinal"), -1),
                 params.get("field_name"),
                 params.get("data_type"),
                 parseIntOrDefault(params.get("length"), -1),
-                params.get("comment")));
+                params.get("comment"),
+                Boolean.parseBoolean(params.getOrDefault("allow_repack", "false"))));
         });
 
         server.createContext("/remove_struct_field", exchange -> {
@@ -484,7 +503,8 @@ public class GhidraMCPPlugin extends Plugin {
                 Boolean.parseBoolean(params.getOrDefault("has_new_length", "false")),
                 parseIntOrDefault(params.get("new_length"), -1),
                 Boolean.parseBoolean(params.getOrDefault("has_new_comment", "false")),
-                params.get("new_comment")));
+                params.get("new_comment"),
+                Boolean.parseBoolean(params.getOrDefault("allow_repack", "false"))));
         });
 
         server.createContext("/modify_struct", exchange -> {
@@ -1579,6 +1599,102 @@ public class GhidraMCPPlugin extends Plugin {
         return true;
     }
 
+    private String createStruct(
+            String categoryPathText, String structName, int initialSize,
+            String packingText, int packingValue, String description,
+            boolean createCategory) {
+        Program program = getCurrentProgram();
+        if (program == null) {
+            return "Error: no program loaded";
+        }
+        String validationError = validateStructReference(categoryPathText, structName);
+        if (validationError != null) {
+            return validationError;
+        }
+        if (initialSize < 0 || initialSize > 64 * 1024 * 1024) {
+            return "Error: initial_size must be between 0 and 67108864 bytes";
+        }
+
+        String packing = packingText == null || packingText.isBlank()
+            ? "disabled" : packingText.trim().toLowerCase();
+        if (!Set.of("disabled", "default", "explicit").contains(packing)) {
+            return "Error: packing must be disabled, default, or explicit";
+        }
+        if (!"disabled".equals(packing) && initialSize != 0) {
+            return "Error: initial_size must be 0 for packed structures because " +
+                "their size is derived from fields";
+        }
+        if ("explicit".equals(packing) && packingValue <= 0) {
+            return "Error: packing_value must be greater than zero for explicit packing";
+        }
+
+        try {
+            DataTypeManager dataTypeManager = program.getDataTypeManager();
+            CategoryPath categoryPath =
+                new CategoryPath(normalizeCategoryPath(categoryPathText));
+            boolean folderCreated = !dataTypeManager.containsCategory(categoryPath);
+            if (folderCreated && !createCategory) {
+                return "Error: Data Type Manager folder does not exist: " + categoryPath +
+                    "; set create_category=true to create it";
+            }
+            DataType existing = dataTypeManager.getDataType(
+                categoryPath, structName.trim());
+            if (existing != null) {
+                return "Error: a data type already exists at " + existing.getPathName();
+            }
+
+            int transaction = program.startTransaction("Create structure");
+            boolean commit = false;
+            try {
+                if (folderCreated) {
+                    dataTypeManager.createCategory(categoryPath);
+                }
+
+                StructureDataType newStructure = new StructureDataType(
+                    categoryPath, structName.trim(), initialSize);
+                String normalizedDescription = normalizeNullableStructText(description);
+                if (normalizedDescription != null) {
+                    newStructure.setDescription(normalizedDescription);
+                }
+                if ("default".equals(packing)) {
+                    newStructure.setPackingEnabled(true);
+                    newStructure.setToDefaultPacking();
+                }
+                else if ("explicit".equals(packing)) {
+                    newStructure.setPackingEnabled(true);
+                    newStructure.setExplicitPackingValue(packingValue);
+                }
+
+                DataType added = dataTypeManager.addDataType(
+                    newStructure, DataTypeConflictHandler.DEFAULT_HANDLER);
+                if (!(added instanceof Structure structure) ||
+                        !categoryPath.equals(added.getCategoryPath()) ||
+                        !structName.trim().equals(added.getName())) {
+                    throw new IllegalStateException(
+                        "Ghidra resolved the structure to an unexpected path");
+                }
+
+                commit = true;
+                return "Structure created successfully\n" +
+                    "Path: " + structure.getPathName() + "\n" +
+                    "Packing: " + packing +
+                        ("explicit".equals(packing)
+                            ? " (value " + packingValue + ")" : "") + "\n" +
+                    "Requested Initial Size: " + initialSize + " bytes\n" +
+                    "Current Size: " + structure.getLength() + " bytes\n" +
+                    "Description: " + (normalizedDescription == null
+                        ? "<none>" : normalizedDescription) + "\n" +
+                    "Folder Created: " + folderCreated;
+            }
+            finally {
+                program.endTransaction(transaction, commit);
+            }
+        }
+        catch (Exception e) {
+            return formatStructError("creating structure", e);
+        }
+    }
+
     private String listStructFields(String categoryPathText, String structName) {
         Program program = getCurrentProgram();
         if (program == null) {
@@ -1628,8 +1744,9 @@ public class GhidraMCPPlugin extends Plugin {
     }
 
     private String addStructField(
-            String categoryPathText, String structName, int offset, String fieldName,
-            String dataTypeReference, int requestedLength, String comment) {
+            String categoryPathText, String structName, int offset, int ordinal,
+            String fieldName, String dataTypeReference, int requestedLength,
+            String comment, boolean allowRepack) {
         Program program = getCurrentProgram();
         if (program == null) {
             return "Error: no program loaded";
@@ -1637,9 +1754,6 @@ public class GhidraMCPPlugin extends Plugin {
         String validationError = validateStructReference(categoryPathText, structName);
         if (validationError != null) {
             return validationError;
-        }
-        if (offset < 0) {
-            return "Error: offset must be zero or greater";
         }
         if (fieldName == null || fieldName.isBlank()) {
             return "Error: field_name is required";
@@ -1655,9 +1769,27 @@ public class GhidraMCPPlugin extends Plugin {
             if (structure == null) {
                 return structNotFoundError(categoryPathText, structName);
             }
-            if (structure.isPackingEnabled()) {
-                return "Error: add_struct_field requires a non-packed structure so the " +
-                    "requested offset remains exact: " + structure.getPathName();
+            boolean packedStructure = structure.isPackingEnabled();
+            if (packedStructure) {
+                if (ordinal < 0) {
+                    return "Error: ordinal is required for a packed structure";
+                }
+                if (offset >= 0) {
+                    return "Error: use ordinal, not offset, when adding to a packed structure";
+                }
+                if (ordinal > structure.getNumComponents()) {
+                    return "Error: ordinal must be between 0 and " +
+                        structure.getNumComponents() + " for " + structure.getPathName();
+                }
+            }
+            else {
+                if (offset < 0) {
+                    return "Error: offset is required for a non-packed structure";
+                }
+                if (ordinal >= 0) {
+                    return "Error: use offset, not ordinal, when adding to a non-packed " +
+                        "structure";
+                }
             }
             DataType fieldDataType = resolveStructDataType(
                 dataTypeManager, dataTypeReference.trim());
@@ -1677,22 +1809,55 @@ public class GhidraMCPPlugin extends Plugin {
             if (fieldLength <= 0) {
                 return "Error: length must be supplied for a dynamically sized data type";
             }
-            String rangeError = validateStructFieldRange(
-                structure, offset, fieldLength, null);
-            if (rangeError != null) {
-                return rangeError;
+            if (!packedStructure) {
+                String rangeError = validateStructFieldRange(
+                    structure, offset, fieldLength, null);
+                if (rangeError != null) {
+                    return rangeError;
+                }
             }
 
+            StructLayout beforeLayout = captureStructLayout(structure);
             int transaction = program.startTransaction("Add struct field");
             boolean commit = false;
             try {
-                ensureStructureLength(structure, offset, fieldLength);
-                DataTypeComponent component = structure.replaceAtOffset(
-                    offset, fieldDataType, fieldLength,
-                    fieldName.trim(), normalizeNullableStructText(comment));
+                DataTypeComponent component;
+                String packedLayoutChanges = null;
+                if (packedStructure) {
+                    if (ordinal == structure.getNumComponents()) {
+                        component = structure.add(
+                            fieldDataType, fieldLength, fieldName.trim(),
+                            normalizeNullableStructText(comment));
+                    }
+                    else {
+                        component = structure.insert(
+                            ordinal, fieldDataType, fieldLength, fieldName.trim(),
+                            normalizeNullableStructText(comment));
+                    }
+
+                    StructLayout afterLayout = captureStructLayout(structure);
+                    packedLayoutChanges = formatPackedInsertionChanges(
+                        beforeLayout, afterLayout, ordinal, component);
+                    if (!allowRepack) {
+                        return "Repack confirmation required; no changes were committed\n" +
+                            "Structure: " + structure.getPathName() + "\n" +
+                            packedLayoutChanges + "\n" +
+                            "Call add_struct_field again with allow_repack=true to commit";
+                    }
+                }
+                else {
+                    ensureStructureLength(structure, offset, fieldLength);
+                    component = structure.replaceAtOffset(
+                        offset, fieldDataType, fieldLength,
+                        fieldName.trim(), normalizeNullableStructText(comment));
+                }
                 commit = true;
                 return "Struct field added successfully\n" +
-                    formatStructComponent(structure, component);
+                    formatStructComponent(structure, component) +
+                    (packedStructure
+                        ? "\nPacked Layout: repacked with explicit approval\n" +
+                            packedLayoutChanges
+                        : "");
             }
             finally {
                 program.endTransaction(transaction, commit);
@@ -1763,7 +1928,8 @@ public class GhidraMCPPlugin extends Plugin {
             boolean hasNewName, String newName,
             boolean hasNewDataType, String newDataTypeReference,
             boolean hasNewLength, int newLength,
-            boolean hasNewComment, String newComment) {
+            boolean hasNewComment, String newComment,
+            boolean allowRepack) {
         Program program = getCurrentProgram();
         if (program == null) {
             return "Error: no program loaded";
@@ -1804,10 +1970,12 @@ public class GhidraMCPPlugin extends Plugin {
                     structure.getPathName();
             }
 
-            boolean layoutChange = hasNewOffset || hasNewDataType || hasNewLength;
-            if (layoutChange && structure.isPackingEnabled()) {
-                return "Error: offset, type, or length changes require a non-packed " +
-                    "structure: " + structure.getPathName();
+            boolean packedStructure = structure.isPackingEnabled();
+            boolean offsetChange = hasNewOffset && newOffset != original.getOffset();
+            boolean layoutChange = offsetChange || hasNewDataType || hasNewLength;
+            if (packedStructure && offsetChange) {
+                return "Error: new_offset cannot be set on a packed structure because " +
+                    "packing determines field offsets: " + structure.getPathName();
             }
             if (layoutChange && original.isBitFieldComponent()) {
                 return "Error: changing the layout of bit fields is not supported";
@@ -1836,13 +2004,15 @@ public class GhidraMCPPlugin extends Plugin {
             if (targetLength <= 0) {
                 return "Error: new_length is required for a dynamically sized data type";
             }
-            int targetOffset = hasNewOffset ? newOffset : original.getOffset();
+            int targetOffset = packedStructure
+                ? original.getOffset()
+                : (hasNewOffset ? newOffset : original.getOffset());
             String targetName = hasNewName
                 ? normalizeNullableStructText(newName) : original.getFieldName();
             String targetComment = hasNewComment
                 ? normalizeNullableStructText(newComment) : original.getComment();
 
-            if (layoutChange) {
+            if (layoutChange && !packedStructure) {
                 String rangeError = validateStructFieldRange(
                     structure, targetOffset, targetLength, original);
                 if (rangeError != null) {
@@ -1853,16 +2023,24 @@ public class GhidraMCPPlugin extends Plugin {
             int oldOffset = original.getOffset();
             String oldName = original.getFieldName();
             String oldType = original.getDataType().getPathName();
+            StructLayout beforeLayout = captureStructLayout(structure);
             int transaction = program.startTransaction("Modify struct field");
             boolean commit = false;
-            DataTypeComponent modified;
             try {
+                DataTypeComponent modified;
                 if (layoutChange) {
-                    structure.clearAtOffset(oldOffset);
-                    ensureStructureLength(structure, targetOffset, targetLength);
-                    modified = structure.replaceAtOffset(
-                        targetOffset, targetDataType, targetLength,
-                        targetName, targetComment);
+                    if (packedStructure) {
+                        modified = structure.replace(
+                            original.getOrdinal(), targetDataType, targetLength,
+                            targetName, targetComment);
+                    }
+                    else {
+                        structure.clearAtOffset(oldOffset);
+                        ensureStructureLength(structure, targetOffset, targetLength);
+                        modified = structure.replaceAtOffset(
+                            targetOffset, targetDataType, targetLength,
+                            targetName, targetComment);
+                    }
                 }
                 else {
                     modified = original;
@@ -1873,16 +2051,38 @@ public class GhidraMCPPlugin extends Plugin {
                         modified = modified.setComment(targetComment);
                     }
                 }
+
+                StructLayout afterLayout = captureStructLayout(structure);
+                boolean repacked = packedStructure &&
+                    hasPackedLayoutChange(beforeLayout, afterLayout);
+                String layoutChanges = formatPackedLayoutChanges(
+                    beforeLayout, afterLayout);
+                if (repacked && !allowRepack) {
+                    return "Repack confirmation required; no changes were committed\n" +
+                        "Structure: " + structure.getPathName() + "\n" +
+                        layoutChanges + "\n" +
+                        "Call modify_struct_field again with allow_repack=true to commit";
+                }
+
                 commit = true;
+                String result = "Struct field modified successfully\n" +
+                    "Old Offset: 0x" +
+                        Integer.toHexString(oldOffset).toUpperCase() + "\n" +
+                    "Old Name: " + (oldName == null ? "<unnamed>" : oldName) + "\n" +
+                    "Old Data Type: " + oldType + "\n" +
+                    formatStructComponent(structure, modified);
+                if (packedStructure) {
+                    result += "\nPacked Layout: " +
+                        (repacked ? "repacked with explicit approval" : "unchanged");
+                    if (repacked) {
+                        result += "\n" + layoutChanges;
+                    }
+                }
+                return result;
             }
             finally {
                 program.endTransaction(transaction, commit);
             }
-            return "Struct field modified successfully\n" +
-                "Old Offset: 0x" + Integer.toHexString(oldOffset).toUpperCase() + "\n" +
-                "Old Name: " + (oldName == null ? "<unnamed>" : oldName) + "\n" +
-                "Old Data Type: " + oldType + "\n" +
-                formatStructComponent(structure, modified);
         }
         catch (Exception e) {
             return formatStructError("modifying struct field", e);
@@ -2131,6 +2331,128 @@ public class GhidraMCPPlugin extends Plugin {
         return "Error " + operation + ": " +
             (message == null || message.isBlank()
                 ? exception.getClass().getSimpleName() : message);
+    }
+
+    private StructLayout captureStructLayout(Structure structure) {
+        List<StructFieldLayout> fields = new ArrayList<>();
+        for (DataTypeComponent component : structure.getDefinedComponents()) {
+            fields.add(new StructFieldLayout(
+                component.getOrdinal(),
+                component.getOffset(),
+                component.getLength(),
+                component.getFieldName(),
+                component.getDataType().getPathName()));
+        }
+        return new StructLayout(structure.getLength(), List.copyOf(fields));
+    }
+
+    private boolean hasPackedLayoutChange(StructLayout before, StructLayout after) {
+        if (before.size() != after.size() || before.fields().size() != after.fields().size()) {
+            return true;
+        }
+        Map<Integer, StructFieldLayout> afterByOrdinal = new HashMap<>();
+        for (StructFieldLayout field : after.fields()) {
+            afterByOrdinal.put(field.ordinal(), field);
+        }
+        for (StructFieldLayout beforeField : before.fields()) {
+            StructFieldLayout afterField = afterByOrdinal.get(beforeField.ordinal());
+            if (afterField == null || beforeField.offset() != afterField.offset()) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private String formatPackedLayoutChanges(StructLayout before, StructLayout after) {
+        StringBuilder result = new StringBuilder();
+        result.append("Structure Size: ")
+            .append(before.size()).append(" -> ").append(after.size()).append(" bytes");
+
+        Map<Integer, StructFieldLayout> afterByOrdinal = new HashMap<>();
+        for (StructFieldLayout field : after.fields()) {
+            afterByOrdinal.put(field.ordinal(), field);
+        }
+        boolean reportedFieldChange = false;
+        for (StructFieldLayout beforeField : before.fields()) {
+            StructFieldLayout afterField = afterByOrdinal.get(beforeField.ordinal());
+            String fieldName = beforeField.name() == null
+                ? "ordinal " + beforeField.ordinal()
+                : beforeField.name();
+            if (afterField == null) {
+                result.append("\nRemoved Field: ").append(fieldName)
+                    .append(" at 0x")
+                    .append(Integer.toHexString(beforeField.offset()).toUpperCase());
+                reportedFieldChange = true;
+                continue;
+            }
+            if (beforeField.offset() != afterField.offset()) {
+                result.append("\nOffset Change: ").append(fieldName)
+                    .append(" 0x")
+                    .append(Integer.toHexString(beforeField.offset()).toUpperCase())
+                    .append(" -> 0x")
+                    .append(Integer.toHexString(afterField.offset()).toUpperCase());
+                reportedFieldChange = true;
+            }
+            if (beforeField.length() != afterField.length()) {
+                result.append("\nLength Change: ").append(fieldName).append(' ')
+                    .append(beforeField.length()).append(" -> ")
+                    .append(afterField.length()).append(" bytes");
+                reportedFieldChange = true;
+            }
+        }
+        if (after.fields().size() > before.fields().size()) {
+            result.append("\nDefined Field Count: ")
+                .append(before.fields().size()).append(" -> ")
+                .append(after.fields().size());
+            reportedFieldChange = true;
+        }
+        if (!reportedFieldChange && before.size() == after.size()) {
+            result.append("\nNo field offsets or total size changed");
+        }
+        return result.toString();
+    }
+
+    private String formatPackedInsertionChanges(
+            StructLayout before, StructLayout after, int insertionOrdinal,
+            DataTypeComponent insertedComponent) {
+        StringBuilder result = new StringBuilder();
+        result.append("Structure Size: ")
+            .append(before.size()).append(" -> ").append(after.size()).append(" bytes")
+            .append("\nInserted Field: ")
+            .append(insertedComponent.getFieldName() == null
+                ? "<unnamed>" : insertedComponent.getFieldName())
+            .append(" at ordinal ").append(insertedComponent.getOrdinal())
+            .append(", offset 0x")
+            .append(Integer.toHexString(insertedComponent.getOffset()).toUpperCase())
+            .append(", length ").append(insertedComponent.getLength()).append(" bytes");
+
+        Map<Integer, StructFieldLayout> afterByOrdinal = new HashMap<>();
+        for (StructFieldLayout field : after.fields()) {
+            afterByOrdinal.put(field.ordinal(), field);
+        }
+        for (StructFieldLayout beforeField : before.fields()) {
+            int afterOrdinal = beforeField.ordinal() >= insertionOrdinal
+                ? beforeField.ordinal() + 1 : beforeField.ordinal();
+            StructFieldLayout afterField = afterByOrdinal.get(afterOrdinal);
+            if (afterField == null || beforeField.offset() == afterField.offset()) {
+                continue;
+            }
+            result.append("\nOffset Change: ")
+                .append(beforeField.name() == null
+                    ? "ordinal " + beforeField.ordinal() : beforeField.name())
+                .append(" 0x")
+                .append(Integer.toHexString(beforeField.offset()).toUpperCase())
+                .append(" -> 0x")
+                .append(Integer.toHexString(afterField.offset()).toUpperCase());
+        }
+        return result.toString();
+    }
+
+    private record StructFieldLayout(
+            int ordinal, int offset, int length, String name, String dataTypePath) {
+    }
+
+    private record StructLayout(int size, List<StructFieldLayout> fields) {
     }
 
     private String formatGlobalDataResult(String status, Data data, Symbol labelSymbol) {
