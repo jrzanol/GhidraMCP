@@ -273,6 +273,54 @@ def get_function_xrefs(name: str, offset: int = 0, limit: int = 100) -> list:
     return safe_get("function_xrefs", {"name": name, "offset": offset, "limit": limit})
 
 @mcp.tool()
+def list_function_tags(function_address: str | None = None) -> list:
+    """
+    List function tags.
+
+    Without an address, returns every tag defined in the current program with its
+    description and use count. With an address, returns only the tags assigned to
+    the function at or containing that address.
+
+    Args:
+        function_address: Optional function address, such as ``00523000``.
+    """
+    params = {}
+    if function_address:
+        params["function_address"] = function_address
+    return safe_get("function_tags", params)
+
+@mcp.tool()
+def add_function_tag(
+    function_address: str,
+    tag_name: str,
+    tag_description: str = "",
+) -> str:
+    """
+    Add a function tag to a non-thunk function.
+
+    The plugin resolves the function at or containing the supplied address, rejects
+    thunk functions, creates the tag when necessary, and commits the assignment in
+    a Ghidra program transaction.
+
+    Args:
+        function_address: Address of the target function, such as ``00523000``.
+        tag_name: Tag to assign, such as ``TMNativeAPI::Network``.
+        tag_description: Optional description used only when creating a new tag.
+    """
+    if not function_address:
+        return "Error: function_address is required"
+    if not tag_name or not tag_name.strip():
+        return "Error: tag_name is required"
+    if "\n" in tag_name or "\r" in tag_name:
+        return "Error: tag_name must be a single line"
+
+    return safe_post("add_function_tag", {
+        "function_address": function_address,
+        "tag_name": tag_name.strip(),
+        "tag_description": tag_description,
+    })
+
+@mcp.tool()
 def list_strings(offset: int = 0, limit: int = 2000, filter: str = None) -> list:
     """
     List all defined strings in the program with their addresses.

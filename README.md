@@ -75,6 +75,9 @@ Alternatively, edit this file directly:
 
 The server IP and port are configurable and should be set to point to the target Ghidra instance. If not set, both will default to localhost:8080.
 
+See [MCP_TOOLS.md](MCP_TOOLS.md) for the complete tool reference, parameters, and
+usage examples.
+
 ### Running Ghidra scripts
 
 The `execute_ghidra_script` MCP tool runs a trusted script from an enabled

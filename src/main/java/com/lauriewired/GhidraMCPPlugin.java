@@ -341,6 +341,19 @@ public class GhidraMCPPlugin extends Plugin {
             sendResponse(exchange, getFunctionXrefs(name, offset, limit));
         });
 
+        server.createContext("/function_tags", exchange -> {
+            Map<String, String> qparams = parseQueryParams(exchange);
+            sendResponse(exchange, listFunctionTags(qparams.get("function_address")));
+        });
+
+        server.createContext("/add_function_tag", exchange -> {
+            Map<String, String> params = parsePostParams(exchange);
+            sendResponse(exchange, addFunctionTag(
+                params.get("function_address"),
+                params.get("tag_name"),
+                params.get("tag_description")));
+        });
+
         server.createContext("/strings", exchange -> {
             Map<String, String> qparams = parseQueryParams(exchange);
             int offset = parseIntOrDefault(qparams.get("offset"), 0);
@@ -913,6 +926,146 @@ public class GhidraMCPPlugin extends Plugin {
             func = program.getFunctionManager().getFunctionContaining(addr);
         }
         return func;
+    }
+
+    /**
+     * List every defined function tag, or only the tags assigned to one function.
+     */
+    private String listFunctionTags(String functionAddress) {
+        Program program = getCurrentProgram();
+        if (program == null) {
+            return "Error: no program loaded";
+        }
+
+        try {
+            FunctionTagManager tagManager =
+                program.getFunctionManager().getFunctionTagManager();
+            if (functionAddress == null || functionAddress.isBlank()) {
+                List<FunctionTag> tags = new ArrayList<>(tagManager.getAllFunctionTags());
+                tags.sort(Comparator.comparing(FunctionTag::getName, String.CASE_INSENSITIVE_ORDER));
+                if (tags.isEmpty()) {
+                    return "No function tags defined";
+                }
+
+                StringBuilder result = new StringBuilder();
+                for (FunctionTag tag : tags) {
+                    result.append(tag.getName())
+                        .append(" | uses=").append(tagManager.getUseCount(tag));
+                    String comment = normalizeTagComment(tag.getComment());
+                    if (!comment.isEmpty()) {
+                        result.append(" | description=").append(comment);
+                    }
+                    result.append('\n');
+                }
+                return result.toString().stripTrailing();
+            }
+
+            Address address = program.getAddressFactory().getAddress(functionAddress);
+            if (address == null) {
+                return "Error: invalid function address: " + functionAddress;
+            }
+            Function function = getFunctionForAddress(program, address);
+            if (function == null) {
+                return "Error: no function found at or containing address " + functionAddress;
+            }
+
+            List<FunctionTag> tags = new ArrayList<>(function.getTags());
+            tags.sort(Comparator.comparing(FunctionTag::getName, String.CASE_INSENSITIVE_ORDER));
+            StringBuilder result = new StringBuilder();
+            result.append("Function: ").append(function.getName())
+                .append(" at ").append(function.getEntryPoint())
+                .append(" | thunk=").append(function.isThunk())
+                .append('\n');
+            if (tags.isEmpty()) {
+                result.append("No tags assigned");
+                return result.toString();
+            }
+
+            for (FunctionTag tag : tags) {
+                result.append(tag.getName());
+                String comment = normalizeTagComment(tag.getComment());
+                if (!comment.isEmpty()) {
+                    result.append(" | description=").append(comment);
+                }
+                result.append('\n');
+            }
+            return result.toString().stripTrailing();
+        }
+        catch (Exception e) {
+            Msg.error(this, "Error listing function tags", e);
+            return "Error listing function tags: " + e.getMessage();
+        }
+    }
+
+    /**
+     * Add a tag to a non-thunk function in a program transaction.
+     */
+    private String addFunctionTag(
+            String functionAddress, String tagName, String tagDescription) {
+        Program program = getCurrentProgram();
+        if (program == null) {
+            return "Error: no program loaded";
+        }
+        if (functionAddress == null || functionAddress.isBlank()) {
+            return "Error: function_address is required";
+        }
+        if (tagName == null || tagName.isBlank()) {
+            return "Error: tag_name is required";
+        }
+
+        String normalizedTagName = tagName.trim();
+        if (normalizedTagName.indexOf('\n') >= 0 || normalizedTagName.indexOf('\r') >= 0) {
+            return "Error: tag_name must be a single line";
+        }
+
+        try {
+            Address address = program.getAddressFactory().getAddress(functionAddress);
+            if (address == null) {
+                return "Error: invalid function address: " + functionAddress;
+            }
+            Function function = getFunctionForAddress(program, address);
+            if (function == null) {
+                return "Error: no function found at or containing address " + functionAddress;
+            }
+            if (function.isThunk()) {
+                return "Error: refusing to add a tag to thunk function " +
+                    function.getName() + " at " + function.getEntryPoint();
+            }
+
+            int transaction = program.startTransaction("Add function tag");
+            boolean commit = false;
+            try {
+                FunctionTagManager tagManager =
+                    program.getFunctionManager().getFunctionTagManager();
+                FunctionTag tag = tagManager.getFunctionTag(normalizedTagName);
+                if (tag == null) {
+                    String description = tagDescription == null ? "" : tagDescription.trim();
+                    tag = tagManager.createFunctionTag(normalizedTagName, description);
+                }
+
+                boolean added = function.addTag(tag.getName());
+                commit = true;
+                if (!added) {
+                    return "Function already has tag " + tag.getName() + ": " +
+                        function.getName() + " at " + function.getEntryPoint();
+                }
+                return "Function tag added successfully: " + tag.getName() + " -> " +
+                    function.getName() + " at " + function.getEntryPoint();
+            }
+            finally {
+                program.endTransaction(transaction, commit);
+            }
+        }
+        catch (Exception e) {
+            Msg.error(this, "Error adding function tag", e);
+            String message = e.getMessage();
+            return "Error adding function tag: " +
+                (message == null || message.isBlank() ? e.getClass().getSimpleName() : message);
+        }
+    }
+
+    private String normalizeTagComment(String comment) {
+        return comment == null ? "" : comment.replace('\r', ' ').replace('\n', ' ').trim();
     }
 
     /**
