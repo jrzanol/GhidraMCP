@@ -1,6 +1,11 @@
 # Maven target directory
 /target/
 
+# Gradle cache and build outputs
+/.gradle/
+/build/
+/dist/
+
 # Compiled class files
 *.class
 
@@ -44,6 +49,7 @@ mvnw.cmd
 # Environment files
 .env
 .env.*
+.venv/
 
 # Java crash logs (if any)
 hs_err_pid*

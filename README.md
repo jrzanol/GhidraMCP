@@ -99,21 +99,20 @@ Another MCP client that supports multiple models on the backend is [5ire](https:
 3. Command: `python /ABSOLUTE_PATH_TO/bridge_mcp_ghidra.py`
 
 # Building from Source
-1. Copy the following files from your Ghidra directory to this project's `lib/` directory:
-- `Ghidra/Features/Base/lib/Base.jar`
-- `Ghidra/Features/Decompiler/lib/Decompiler.jar`
-- `Ghidra/Framework/Docking/lib/Docking.jar`
-- `Ghidra/Framework/Generic/lib/Generic.jar`
-- `Ghidra/Framework/Project/lib/Project.jar`
-- `Ghidra/Framework/SoftwareModeling/lib/SoftwareModeling.jar`
-- `Ghidra/Framework/Utility/lib/Utility.jar`
-- `Ghidra/Framework/Gui/lib/Gui.jar`
-2. Build with Maven by running:
 
-`mvn clean package assembly:single`
+GhidraMCP 12.1.2 requires Ghidra 12.1.2 and JDK 21. The recommended build uses the
+extension build script distributed with Ghidra:
 
-The generated zip file includes the built Ghidra plugin and its resources. These files are required for Ghidra to recognize the new extension.
+```powershell
+$env:GHIDRA_INSTALL_DIR = 'C:\path\to\ghidra_12.1.2_PUBLIC'
+& "$env:GHIDRA_INSTALL_DIR\support\gradle\gradlew.bat" buildExtension
+```
 
-- lib/GhidraMCP.jar
-- extensions.properties
-- Module.manifest
+On Linux or macOS, set `GHIDRA_INSTALL_DIR` and invoke
+`$GHIDRA_INSTALL_DIR/support/gradle/gradlew buildExtension` instead. The installable
+extension ZIP is generated in `dist/`.
+
+The legacy Maven build remains available. Copy the eight Ghidra JARs referenced by
+`pom.xml` into `lib/`, then run `mvn clean package`. Gradle is preferred because it
+compiles against all modules in the selected Ghidra installation and produces the
+official extension layout.

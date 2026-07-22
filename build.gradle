@@ -1,0 +1,18 @@
+def ghidraInstallDir = providers.gradleProperty('GHIDRA_INSTALL_DIR')
+    .orElse(providers.environmentVariable('GHIDRA_INSTALL_DIR'))
+    .getOrNull()
+
+if (!ghidraInstallDir) {
+    throw new GradleException(
+        'Set GHIDRA_INSTALL_DIR or pass -PGHIDRA_INSTALL_DIR=<path-to-ghidra>.')
+}
+
+apply from: new File(ghidraInstallDir, 'support/buildExtension.gradle')
+
+tasks.named('buildExtension') {
+    exclude '.git/**'
+    exclude '.github/**'
+    exclude '.agents/**'
+    exclude '.codex/**'
+    exclude 'target/**'
+}
